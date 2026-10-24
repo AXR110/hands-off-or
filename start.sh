@@ -12,4 +12,5 @@ python3 voice.py &
 
 # Start frontend in the foreground
 cd ../frontend
+open http://localhost:3000
 npm run dev
