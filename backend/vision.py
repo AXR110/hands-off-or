@@ -2,7 +2,7 @@
 
 Per captured frame:
 
-    cv2.VideoCapture -> MediaPipe HandLandmarker -> PointerSample
+    cv2.VideoCapture -> horizontal mirror -> MediaPipe HandLandmarker -> PointerSample
         x, y         = index fingertip (landmark 8), normalized to the frame
         pinch_active = thumb tip (4) to index tip (8) distance, normalized by
                        the wrist (0) -> middle MCP (9) hand length, with
@@ -181,7 +181,12 @@ class Camera:
 
     def read(self) -> np.ndarray | None:
         ok, frame = self._capture.read()
-        return frame if ok else None
+        if not ok:
+            return None
+        # A front camera is mirrored relative to the user: image-left is their
+        # right. Flip before landmarking so a hand moving right increases x,
+        # and so the JPEG sent to the bridge matches the pointer.
+        return cv2.flip(frame, 1)
 
     def release(self) -> None:
         self._capture.release()
