@@ -21,6 +21,14 @@ const MAX_ZOOM = 4;
 const ZOOM_START_PX = 48;
 const DOUBLE_PINCH_MS = 650;
 const DOUBLE_PINCH_SLOP_PX = 140;
+// A flick while one pinch is held. Slow drifts and sideways motion stay put.
+const SWIPE_WINDOW_MS = 320;
+const SWIPE_MIN_MS = 80;
+const SWIPE_MIN_SAMPLES = 3;
+const SWIPE_MIN_SPEED = 0.45;
+const SWIPE_AXIS_RATIO = 1.5;
+// One film per flick. Pinch tracking can drop for a frame mid-swipe; wait until it stays open.
+const SWIPE_RELEASE_MS = 320;
 
 type Point = { x: number; y: number };
 
@@ -35,6 +43,12 @@ type PinchMark = {
   at: number;
   x: number;
   y: number;
+};
+
+type SwipeSample = {
+  x: number;
+  y: number;
+  at: number;
 };
 
 type ImageLayout = {
@@ -115,6 +129,64 @@ function studyAtPoint(x: number, y: number): StudyId | null {
   const id = element?.closest("[data-study]")?.getAttribute("data-study");
   if (id === "chest" || id === "hand" || id === "teeth") return id;
   return null;
+}
+
+function pointerOverStage(x: number, y: number, stage: DOMRect | undefined) {
+  if (!stage || stage.width <= 0 || stage.height <= 0) return false;
+  const px = x * window.innerWidth;
+  const py = y * window.innerHeight;
+  return px >= stage.left && px <= stage.right && py >= stage.top && py <= stage.bottom;
+}
+
+// 1 = finger traveled up, so show the next film. -1 = finger traveled down, so go back.
+function classifyVerticalSwipe(
+  samples: SwipeSample[],
+  viewportWidth: number,
+  viewportHeight: number,
+): -1 | 1 | null {
+  if (samples.length < SWIPE_MIN_SAMPLES || viewportWidth < 1 || viewportHeight < 1) return null;
+  const minTravel = Math.max(72, viewportHeight * 0.08);
+  let bestSpeed = 0;
+  let best: -1 | 1 | null = null;
+
+  for (let start = 0; start < samples.length - 1; start += 1) {
+    const from = samples[start];
+    const to = samples[samples.length - 1];
+    const elapsed = to.at - from.at;
+    if (elapsed < SWIPE_MIN_MS || elapsed > SWIPE_WINDOW_MS) continue;
+    const dx = (to.x - from.x) * viewportWidth;
+    const dy = (to.y - from.y) * viewportHeight;
+    const absX = Math.abs(dx);
+    const absY = Math.abs(dy);
+    if (absY < minTravel || absY < absX * SWIPE_AXIS_RATIO) continue;
+    const speed = absY / elapsed;
+    if (speed < SWIPE_MIN_SPEED || speed <= bestSpeed) continue;
+    if (!swipePathAgrees(samples, start)) continue;
+    bestSpeed = speed;
+    best = dy < 0 ? 1 : -1;
+  }
+  return best;
+}
+
+function swipePathAgrees(samples: SwipeSample[], start: number) {
+  const sign = Math.sign(samples[samples.length - 1].y - samples[start].y);
+  if (sign === 0) return false;
+  let agreeing = 0;
+  let steps = 0;
+  let largest = 0;
+  let total = 0;
+  for (let index = start + 1; index < samples.length; index += 1) {
+    const step = samples[index].y - samples[index - 1].y;
+    if (Math.abs(step) < 0.003) continue;
+    steps += 1;
+    const magnitude = Math.abs(step);
+    total += magnitude;
+    if (magnitude > largest) largest = magnitude;
+    if (Math.sign(step) === sign) agreeing += 1;
+  }
+  // One jumped sample is tracking noise. A flick keeps moving for several frames.
+  if (steps < 2 || agreeing / steps < 0.7 || total <= 0) return false;
+  return largest / total <= 0.8;
 }
 
 type ConnectionStatus = "connecting" | "online" | "reconnecting";
@@ -321,6 +393,13 @@ export default function SurgicalDashboard() {
   const imageRef = useRef<HTMLImageElement>(null);
   const lastPrimaryPinch = useRef<PinchMark | null>(null);
   const lastSecondaryPinch = useRef<PinchMark | null>(null);
+  const selectedRef = useRef(selected);
+  const swipeGesture = useRef<{
+    samples: SwipeSample[];
+    fired: boolean;
+    idleSince: number | null;
+  } | null>(null);
+  selectedRef.current = selected;
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -422,6 +501,38 @@ export default function SurgicalDashboard() {
     return true;
   };
 
+  const advanceStudy = (direction: -1 | 1) => {
+    const current = selectedRef.current;
+    const index = STUDIES.findIndex((item) => item.id === current);
+    if (index < 0) return;
+    const next = STUDIES[(index + direction + STUDIES.length) % STUDIES.length];
+    if (!next || next.id === current) return;
+    selectedRef.current = next.id;
+    lastPrimaryPinch.current = null;
+    lastSecondaryPinch.current = null;
+    focusStudy(next.id);
+  };
+
+  const appendSwipe = (x: number, y: number) => {
+    const gesture = swipeGesture.current;
+    if (!gesture || gesture.fired) return;
+    const now = performance.now();
+    gesture.samples.push({ x, y, at: now });
+    const cutoff = now - SWIPE_WINDOW_MS;
+    while (gesture.samples.length > SWIPE_MIN_SAMPLES && gesture.samples[0].at < cutoff) {
+      gesture.samples.shift();
+    }
+    const direction = classifyVerticalSwipe(
+      gesture.samples,
+      window.innerWidth,
+      window.innerHeight,
+    );
+    if (direction == null) return;
+    gesture.fired = true;
+    gesture.samples = [];
+    advanceStudy(direction);
+  };
+
   const onPinchDown = (x: number, y: number, mark: { current: PinchMark | null }) => {
     const now = performance.now();
     const prior = mark.current;
@@ -477,11 +588,61 @@ export default function SurgicalDashboard() {
       }
     } else {
       zoomGesture.current = null;
-      if (telemetry.pinch_active && !pinchEdge.current.primary) {
-        onPinchDown(telemetry.x, telemetry.y, lastPrimaryPinch);
-      }
-      if (second && pinch2 && !pinchEdge.current.secondary) {
+    }
+
+    const stage = stageRef.current?.getBoundingClientRect();
+    const secondPinchActive = second && pinch2 === true;
+    const anyPinch = telemetry.pinch_active || secondPinchActive;
+    const primaryOnly = telemetry.pinch_active && !secondPinchActive;
+    const secondaryOnly = secondPinchActive && !telemetry.pinch_active;
+    const primaryDown = telemetry.pinch_active && !pinchEdge.current.primary;
+    const secondaryDown = secondPinchActive && !pinchEdge.current.secondary;
+    const pinchPoint = primaryOnly
+      ? { x: telemetry.x, y: telemetry.y }
+      : secondaryOnly && typeof x2 === "number" && typeof y2 === "number"
+        ? { x: x2, y: y2 }
+        : null;
+
+    if (
+      swipeGesture.current?.fired &&
+      swipeGesture.current.idleSince != null &&
+      performance.now() - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS
+    ) {
+      swipeGesture.current = null;
+    }
+
+    const startedOnFilm =
+      pinchPoint != null &&
+      (primaryDown || secondaryDown) &&
+      swipeGesture.current == null &&
+      pointerOverStage(pinchPoint.x, pinchPoint.y, stage);
+
+    // Thumbnail focus and double-pinch zoom only see a pinch that is not already a film swipe.
+    if (!both && swipeGesture.current == null) {
+      if (primaryDown) onPinchDown(telemetry.x, telemetry.y, lastPrimaryPinch);
+      if (secondaryDown && typeof x2 === "number" && typeof y2 === "number") {
         onPinchDown(x2, y2, lastSecondaryPinch);
+      }
+    }
+
+    if (both) {
+      if (!swipeGesture.current?.fired) swipeGesture.current = null;
+    } else if (pinchPoint && swipeGesture.current) {
+      swipeGesture.current.idleSince = null;
+      appendSwipe(pinchPoint.x, pinchPoint.y);
+    } else if (startedOnFilm && pinchPoint) {
+      swipeGesture.current = {
+        samples: [{ x: pinchPoint.x, y: pinchPoint.y, at: performance.now() }],
+        fired: false,
+        idleSince: null,
+      };
+    } else if (!anyPinch && swipeGesture.current) {
+      if (!swipeGesture.current.fired) {
+        swipeGesture.current = null;
+      } else {
+        const now = performance.now();
+        if (swipeGesture.current.idleSince == null) swipeGesture.current.idleSince = now;
+        if (now - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS) swipeGesture.current = null;
       }
     }
 
@@ -638,7 +799,7 @@ export default function SurgicalDashboard() {
                   {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
                 </span>
                 <span className="mt-0.5 block text-[9px] tracking-[0.14em] text-slate-600 uppercase">
-                  Pinch twice to zoom here
+                  Pinch twice to zoom · pinch and swipe up or down to change
                 </span>
               </span>
             </div>
