@@ -6,6 +6,29 @@ const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws
 const LOG_LIMIT = 50;
 const KNOWN_TOOLS = ["set_pointer", "set_pinch"];
 
+const STUDIES = [
+  { id: "chest", label: "Chest", detail: "PA chest", src: "/studies/chest.png" },
+  { id: "hand", label: "Hand", detail: "Hand", src: "/studies/hand.png" },
+  { id: "teeth", label: "Teeth", detail: "Dental", src: "/studies/teeth.png" },
+] as const;
+
+type StudyId = (typeof STUDIES)[number]["id"];
+
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 4;
+const ZOOM_START_PX = 48;
+
+function clampZoom(scale: number) {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, scale));
+}
+
+function studyAtPoint(x: number, y: number): StudyId | null {
+  const element = document.elementFromPoint(x * window.innerWidth, y * window.innerHeight);
+  const id = element?.closest("[data-study]")?.getAttribute("data-study");
+  if (id === "chest" || id === "hand" || id === "teeth") return id;
+  return null;
+}
+
 type ConnectionStatus = "connecting" | "online" | "reconnecting";
 
 // Mirrors $defs/telemetryEvent and $defs/stateSnapshot in backend/shared_schema.json.
@@ -19,6 +42,9 @@ type Telemetry = {
   client_ts: number | null;
   client_seq: number | null;
   server_ts: number;
+  x2?: number | null;
+  y2?: number | null;
+  pinch2_active?: boolean | null;
 };
 
 // Mirrors $defs/functionCall.
@@ -141,21 +167,35 @@ function formatClock(timestamp: number) {
   });
 }
 
-function PointerCursor({ telemetry }: { telemetry: Telemetry | null }) {
-  if (!telemetry) return null;
-  const pinched = telemetry.pinch_active;
+function PointerCursor({
+  x,
+  y,
+  pinched,
+  tone = "sky",
+}: {
+  x: number;
+  y: number;
+  pinched: boolean;
+  tone?: "sky" | "amber";
+}) {
+  const open =
+    tone === "amber"
+      ? "h-9 w-9 border-2 border-amber-300/90 bg-amber-300/10 shadow-[0_0_28px_rgba(251,191,36,0.45)]"
+      : "h-9 w-9 border-2 border-sky-400/90 bg-sky-400/10 shadow-[0_0_28px_rgba(56,189,248,0.55)]";
+  const closed =
+    tone === "amber"
+      ? "h-3 w-3 border border-amber-100 bg-amber-300 shadow-[0_0_18px_4px_rgba(251,191,36,0.8)]"
+      : "h-3 w-3 border border-sky-200 bg-sky-300 shadow-[0_0_18px_4px_rgba(125,211,252,0.85)]";
 
   return (
     <div
       aria-hidden
       className="pointer-events-none fixed z-50 transition-[left,top] duration-100 ease-linear"
-      style={{ left: `${telemetry.x * 100}%`, top: `${telemetry.y * 100}%` }}
+      style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
     >
       <div
         className={`-translate-x-1/2 -translate-y-1/2 rounded-full transition-all duration-150 ease-out ${
-          pinched
-            ? "h-3 w-3 border border-sky-200 bg-sky-300 shadow-[0_0_18px_4px_rgba(125,211,252,0.85)]"
-            : "h-9 w-9 border-2 border-sky-400/90 bg-sky-400/10 shadow-[0_0_28px_rgba(56,189,248,0.55)]"
+          pinched ? closed : open
         }`}
       />
     </div>
@@ -164,6 +204,12 @@ function PointerCursor({ telemetry }: { telemetry: Telemetry | null }) {
 
 export default function SurgicalDashboard() {
   const { status, telemetry, calls, counts } = useBridge();
+  const [selected, setSelected] = useState<StudyId>("chest");
+  const [scale, setScale] = useState(MIN_ZOOM);
+  const [hovered, setHovered] = useState<StudyId | null>(null);
+  const scaleRef = useRef(MIN_ZOOM);
+  const zoomGesture = useRef<{ baseline: number; scale: number } | null>(null);
+  const pinchEdge = useRef({ primary: false, secondary: false });
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -175,6 +221,66 @@ export default function SurgicalDashboard() {
   );
   const maxCount = Math.max(1, ...toolNames.map((name) => counts[name] ?? 0));
   const pinchActive = telemetry?.pinch_active ?? false;
+  const secondHand =
+    telemetry != null &&
+    typeof telemetry.x2 === "number" &&
+    typeof telemetry.y2 === "number" &&
+    typeof telemetry.pinch2_active === "boolean";
+  const secondPinch = Boolean(secondHand && telemetry?.pinch2_active);
+  const study = STUDIES.find((item) => item.id === selected) ?? STUDIES[0];
+  const zoomPercent = Math.round(scale * 100);
+
+  const focusStudy = (id: StudyId | null) => {
+    if (!id) return;
+    setSelected(id);
+    scaleRef.current = MIN_ZOOM;
+    setScale(MIN_ZOOM);
+  };
+
+  useEffect(() => {
+    if (!telemetry) return;
+    const x2 = telemetry.x2;
+    const y2 = telemetry.y2;
+    const pinch2 = telemetry.pinch2_active;
+    const second =
+      typeof x2 === "number" && typeof y2 === "number" && typeof pinch2 === "boolean";
+    const both = telemetry.pinch_active && second && pinch2 === true;
+
+    if (both && second) {
+      const distance = Math.hypot(
+        (x2 - telemetry.x) * window.innerWidth,
+        (y2 - telemetry.y) * window.innerHeight,
+      );
+      if (!zoomGesture.current) {
+        if (distance >= ZOOM_START_PX) {
+          zoomGesture.current = { baseline: distance, scale: scaleRef.current };
+        }
+      } else {
+        const next = clampZoom(
+          zoomGesture.current.scale * (distance / zoomGesture.current.baseline),
+        );
+        scaleRef.current = next;
+        setScale(next);
+      }
+    } else {
+      zoomGesture.current = null;
+      if (telemetry.pinch_active && !pinchEdge.current.primary) {
+        focusStudy(studyAtPoint(telemetry.x, telemetry.y));
+      }
+      if (second && pinch2 && !pinchEdge.current.secondary) {
+        focusStudy(studyAtPoint(x2, y2));
+      }
+    }
+
+    pinchEdge.current = {
+      primary: telemetry.pinch_active,
+      secondary: Boolean(second && pinch2),
+    };
+
+    const nextHover =
+      studyAtPoint(telemetry.x, telemetry.y) ?? (second ? studyAtPoint(x2, y2) : null);
+    setHovered((current) => (current === nextHover ? current : nextHover));
+  }, [telemetry]);
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[#05070d] text-slate-200">
@@ -224,6 +330,17 @@ export default function SurgicalDashboard() {
             >
               PINCH
             </span>
+            {secondHand && (
+              <span
+                className={`rounded border px-2 py-0.5 tracking-[0.18em] transition-colors ${
+                  secondPinch
+                    ? "border-amber-300/70 bg-amber-300/20 text-amber-100"
+                    : "border-slate-700/80 text-slate-600"
+                }`}
+              >
+                PINCH 2
+              </span>
+            )}
           </dl>
 
           <span
@@ -249,36 +366,78 @@ export default function SurgicalDashboard() {
       </header>
 
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-        <main className="min-h-0 flex-1 p-3 sm:p-5">
-          <section className="flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-slate-800/80 bg-[#060a12] shadow-[inset_0_0_120px_rgba(14,165,233,0.06)]">
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
+          <nav
+            aria-label="Studies"
+            className="flex shrink-0 gap-2 overflow-x-auto border-b border-slate-800/80 bg-[#070b14] p-3 md:w-44 md:flex-col md:overflow-y-auto md:border-r md:border-b-0"
+          >
+            <div className="hidden shrink-0 md:block">
+              <h2 className="text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase">
+                Studies
+              </h2>
+              <p className="mt-1 text-[10px] leading-relaxed tracking-wider text-slate-600 uppercase">
+                Pinch a film to focus it
+              </p>
+            </div>
+            {STUDIES.map((item) => {
+              const active = item.id === selected;
+              const underCursor = item.id === hovered;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  data-study={item.id}
+                  aria-pressed={active}
+                  onClick={() => focusStudy(item.id)}
+                  className={`flex w-28 shrink-0 flex-col gap-2 rounded-lg border p-2 text-left transition-colors md:w-auto ${
+                    active
+                      ? "border-sky-400/80 bg-sky-400/10"
+                      : underCursor
+                        ? "border-sky-400/40 bg-slate-900/80"
+                        : "border-slate-800 bg-slate-950/40 hover:border-slate-700"
+                  }`}
+                >
+                  <img
+                    src={item.src}
+                    alt=""
+                    draggable={false}
+                    className="h-16 w-full rounded bg-black object-cover"
+                  />
+                  <span className="flex flex-col">
+                    <span className="text-xs text-slate-100">{item.label}</span>
+                    <span className="text-[10px] tracking-wider text-slate-500 uppercase">
+                      {item.detail}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </nav>
+
+          <section className="flex h-full min-h-[320px] min-w-0 flex-1 flex-col overflow-hidden bg-[#060a12] md:m-3 md:rounded-xl md:border md:border-slate-800/80 md:shadow-[inset_0_0_120px_rgba(14,165,233,0.06)]">
             <div className="flex items-center justify-between border-b border-slate-800/70 px-4 py-2.5">
               <div className="flex items-center gap-2 text-[10px] tracking-[0.22em] text-slate-500 uppercase">
                 <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
-                Study viewport
+                {study.label} study
               </div>
-              <span className="font-mono text-[10px] tracking-wider text-slate-600">
-                DICOM · 512 × 512
+              <span className="font-mono text-[10px] tracking-wider text-slate-400">
+                {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
               </span>
             </div>
 
-            <div className="scan-grid relative flex flex-1 items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_50%_45%,rgba(14,165,233,0.10),transparent_60%)]">
-              <span className="absolute top-4 left-4 h-6 w-6 border-t-2 border-l-2 border-sky-500/30" />
-              <span className="absolute top-4 right-4 h-6 w-6 border-t-2 border-r-2 border-sky-500/30" />
-              <span className="absolute bottom-4 left-4 h-6 w-6 border-b-2 border-l-2 border-sky-500/30" />
-              <span className="absolute right-4 bottom-4 h-6 w-6 border-b-2 border-r-2 border-sky-500/30" />
+            <div className="scan-grid relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_50%_45%,rgba(14,165,233,0.10),transparent_60%)]">
+              <span className="pointer-events-none absolute top-4 left-4 h-6 w-6 border-t-2 border-l-2 border-sky-500/30" />
+              <span className="pointer-events-none absolute top-4 right-4 h-6 w-6 border-t-2 border-r-2 border-sky-500/30" />
+              <span className="pointer-events-none absolute bottom-4 left-4 h-6 w-6 border-b-2 border-l-2 border-sky-500/30" />
+              <span className="pointer-events-none absolute right-4 bottom-4 h-6 w-6 border-b-2 border-r-2 border-sky-500/30" />
 
-              <div className="flex flex-col items-center gap-3 px-6 text-center">
-                <div className="relative grid h-28 w-28 place-items-center rounded-full border border-sky-500/25">
-                  <div className="absolute inset-4 rounded-full border border-sky-500/15" />
-                  <div className="absolute h-px w-full bg-sky-500/20" />
-                  <div className="absolute h-full w-px bg-sky-500/20" />
-                  <div className="h-2 w-2 rounded-full bg-sky-400/80 shadow-[0_0_16px_rgba(56,189,248,0.8)]" />
-                </div>
-                <p className="text-sm text-slate-400">No study loaded</p>
-                <p className="max-w-xs text-[11px] leading-relaxed text-slate-600">
-                  The DICOM viewer mounts here. Pointer telemetry renders above every panel.
-                </p>
-              </div>
+              <img
+                src={study.src}
+                alt={`${study.label} X-ray`}
+                draggable={false}
+                className="max-h-full max-w-full object-contain select-none"
+                style={{ transform: `scale(${scale})` }}
+              />
             </div>
           </section>
         </main>
@@ -366,7 +525,17 @@ export default function SurgicalDashboard() {
         </aside>
       </div>
 
-      <PointerCursor telemetry={telemetry} />
+      {telemetry && (
+        <PointerCursor x={telemetry.x} y={telemetry.y} pinched={telemetry.pinch_active} />
+      )}
+      {secondHand && telemetry && (
+        <PointerCursor
+          x={telemetry.x2 ?? 0}
+          y={telemetry.y2 ?? 0}
+          pinched={secondPinch}
+          tone="amber"
+        />
+      )}
     </div>
   );
 }

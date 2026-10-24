@@ -111,8 +111,18 @@ class TelemetryFrame(BaseModel):
     x: float = Field(ge=0.0, le=1.0)
     y: float = Field(ge=0.0, le=1.0)
     pinch_active: bool
+    x2: float | None = Field(default=None, ge=0.0, le=1.0)
+    y2: float | None = Field(default=None, ge=0.0, le=1.0)
+    pinch2_active: bool | None = None
     ts: int | None = Field(default=None, ge=0)
     seq: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _second_hand(self) -> TelemetryFrame:
+        fields = (self.x2, self.y2, self.pinch2_active)
+        if any(value is not None for value in fields) and any(value is None for value in fields):
+            raise ValueError("x2, y2, and pinch2_active must be sent together")
+        return self
 
 
 class FunctionCallFrame(BaseModel):
@@ -425,6 +435,9 @@ async def handle_telemetry(client: Client, frame: TelemetryFrame) -> None:
         "x": frame.x,
         "y": frame.y,
         "pinch_active": frame.pinch_active,
+        "x2": frame.x2,
+        "y2": frame.y2,
+        "pinch2_active": frame.pinch2_active,
         "source": client.id,
         "seq": bridge.next_seq(),
         "client_ts": frame.ts,

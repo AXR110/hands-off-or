@@ -2,11 +2,13 @@
 
 Per captured frame:
 
-    cv2.VideoCapture -> horizontal mirror -> MediaPipe HandLandmarker -> PointerSample
-        x, y         = index fingertip (landmark 8), normalized to the frame
-        pinch_active = thumb tip (4) to index tip (8) distance, normalized by
-                       the wrist (0) -> middle MCP (9) hand length, with
-                       hysteresis
+    cv2.VideoCapture -> horizontal mirror -> MediaPipe HandLandmarker (2 hands)
+        -> PointerSample
+        x, y, pinch_active    = first hand's index fingertip (landmark 8)
+        x2, y2, pinch2_active = second hand, omitted when only one hand is visible
+        pinch             = thumb tip (4) to index tip (8) distance, normalized by
+                            the wrist (0) -> middle MCP (9) hand length, with
+                            hysteresis, tracked independently per hand
 
 The pinch distance is measured in pixels, so it is not distorted by the frame
 aspect ratio, and divided by the pixel length of wrist -> middle MCP, so the
@@ -69,7 +71,7 @@ MAX_READ_FAILURES = 60  # consecutive dropped reads before giving up (~2 s at ca
 
 
 class HandTracker:
-    """MediaPipe Hand Landmarker in VIDEO mode; returns the first hand's landmarks."""
+    """MediaPipe Hand Landmarker in VIDEO mode; returns up to two hands."""
 
     def __init__(
         self,
@@ -81,7 +83,7 @@ class HandTracker:
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=mp_vision.RunningMode.VIDEO,
-            num_hands=1,
+            num_hands=2,
             min_hand_detection_confidence=min_detection_confidence,
             min_hand_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
@@ -89,14 +91,14 @@ class HandTracker:
         self._landmarker = mp_vision.HandLandmarker.create_from_options(options)
         self._last_timestamp_ms = 0
 
-    def detect(self, frame_bgr: np.ndarray) -> Sequence[Any] | None:
+    def detect(self, frame_bgr: np.ndarray) -> list[Sequence[Any]]:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
         # VIDEO mode requires strictly increasing timestamps.
         timestamp_ms = max(int(time.monotonic() * 1000), self._last_timestamp_ms + 1)
         self._last_timestamp_ms = timestamp_ms
         result = self._landmarker.detect_for_video(image, timestamp_ms)
-        return result.hand_landmarks[0] if result.hand_landmarks else None
+        return list(result.hand_landmarks)
 
     def close(self) -> None:
         self._landmarker.close()
@@ -109,6 +111,9 @@ class PointerSample:
     pinch_active: bool
     pinch_ratio: float
     pinch_distance_px: float
+    x2: float | None = None
+    y2: float | None = None
+    pinch2_active: bool | None = None
 
 
 class PinchDetector:
@@ -160,6 +165,127 @@ def pointer_sample(
         pinch_ratio=ratio,
         pinch_distance_px=distance,
     )
+
+
+def _tip(landmarks: Sequence[Any]) -> tuple[float, float]:
+    index = landmarks[INDEX_TIP]
+    return (min(max(float(index.x), 0.0), 1.0), min(max(float(index.y), 0.0), 1.0))
+
+
+def _slot_distance(previous: tuple[float, float] | None, tip: tuple[float, float]) -> float:
+    if previous is None:
+        return 1e9
+    return math.hypot(previous[0] - tip[0], previous[1] - tip[1])
+
+
+def _assign_hands(
+    previous: Sequence[tuple[float, float] | None],
+    hands: Sequence[Sequence[Any]],
+) -> list[Sequence[Any] | None]:
+    """Keep each hand in the slot it occupied last frame, so pinches do not swap."""
+    if not hands:
+        return [None, None]
+    if len(hands) == 1:
+        hand = hands[0]
+        tip = _tip(hand)
+        prefer_second = previous[1] is not None and (
+            previous[0] is None or _slot_distance(previous[1], tip) < _slot_distance(previous[0], tip)
+        )
+        return [None, hand] if prefer_second else [hand, None]
+
+    first, second = hands[0], hands[1]
+    if previous[0] is None and previous[1] is None:
+        ordered = sorted((first, second), key=lambda hand: _tip(hand)[0])
+        return [ordered[0], ordered[1]]
+    if previous[0] is None:
+        if _slot_distance(previous[1], _tip(first)) <= _slot_distance(previous[1], _tip(second)):
+            return [second, first]
+        return [first, second]
+    if previous[1] is None:
+        if _slot_distance(previous[0], _tip(first)) <= _slot_distance(previous[0], _tip(second)):
+            return [first, second]
+        return [second, first]
+    keep = _slot_distance(previous[0], _tip(first)) + _slot_distance(previous[1], _tip(second))
+    swap = _slot_distance(previous[0], _tip(second)) + _slot_distance(previous[1], _tip(first))
+    return [first, second] if keep <= swap else [second, first]
+
+
+class HandRig:
+    """Two hands, each with its own pinch hysteresis.
+
+    The sample's primary point is the first hand still visible. ``x2``/``y2``
+    are present only while a second hand is visible. A frame with no hands,
+    after a pinch, is one release sample so the cursor does not stay pinched.
+    """
+
+    def __init__(self, engage: float, release: float) -> None:
+        self._detectors = [PinchDetector(engage, release), PinchDetector(engage, release)]
+        self._positions: list[tuple[float, float] | None] = [None, None]
+        self._last: PointerSample | None = None
+
+    @property
+    def engage(self) -> float:
+        return self._detectors[0].engage
+
+    @property
+    def release(self) -> float:
+        return self._detectors[0].release
+
+    @property
+    def any_pinch(self) -> bool:
+        return any(detector.active for detector in self._detectors)
+
+    def update(
+        self,
+        hands: Sequence[Sequence[Any]] | None,
+        frame_shape: Sequence[int],
+    ) -> PointerSample | None:
+        was_pinching = self.any_pinch
+        assigned = _assign_hands(self._positions, list(hands or [])[:2])
+        samples: list[PointerSample] = []
+        for index, landmarks in enumerate(assigned):
+            if not landmarks:
+                self._detectors[index].reset()
+                self._positions[index] = None
+                continue
+            sample = pointer_sample(landmarks, frame_shape, self._detectors[index])
+            if sample is None:
+                self._detectors[index].reset()
+                self._positions[index] = None
+                continue
+            self._positions[index] = (sample.x, sample.y)
+            samples.append(sample)
+
+        if not samples:
+            if was_pinching and self._last is not None:
+                released = PointerSample(
+                    x=self._last.x,
+                    y=self._last.y,
+                    pinch_active=False,
+                    pinch_ratio=self._last.pinch_ratio,
+                    pinch_distance_px=self._last.pinch_distance_px,
+                    x2=self._last.x2,
+                    y2=self._last.y2,
+                    pinch2_active=False if self._last.x2 is not None else None,
+                )
+                self._last = released
+                return released
+            return None
+
+        primary = samples[0]
+        secondary = samples[1] if len(samples) > 1 else None
+        combined = PointerSample(
+            x=primary.x,
+            y=primary.y,
+            pinch_active=primary.pinch_active,
+            pinch_ratio=primary.pinch_ratio,
+            pinch_distance_px=primary.pinch_distance_px,
+            x2=None if secondary is None else secondary.x,
+            y2=None if secondary is None else secondary.y,
+            pinch2_active=None if secondary is None else secondary.pinch_active,
+        )
+        self._last = combined
+        return combined
 
 
 # --- capture + transport ---------------------------------------------------
@@ -219,7 +345,7 @@ def _now_ms() -> int:
 
 
 def telemetry_frame(sample: PointerSample, seq: int) -> dict[str, Any]:
-    return {
+    frame: dict[str, Any] = {
         "type": "telemetry",
         "x": round(sample.x, 5),
         "y": round(sample.y, 5),
@@ -227,6 +353,11 @@ def telemetry_frame(sample: PointerSample, seq: int) -> dict[str, Any]:
         "ts": _now_ms(),
         "seq": seq,
     }
+    if sample.x2 is not None and sample.y2 is not None and sample.pinch2_active is not None:
+        frame["x2"] = round(sample.x2, 5)
+        frame["y2"] = round(sample.y2, 5)
+        frame["pinch2_active"] = sample.pinch2_active
+    return frame
 
 
 def video_frame(frame_bgr: np.ndarray, settings: StreamSettings, seq: int) -> dict[str, Any]:
@@ -246,7 +377,7 @@ async def stream(
     websocket: Any,
     camera: Any,
     tracker: Any,
-    detector: PinchDetector,
+    rig: HandRig,
     settings: StreamSettings,
 ) -> None:
     """Push telemetry and video frames until the socket or camera fails."""
@@ -257,7 +388,6 @@ async def stream(
     last_telemetry_at = 0.0
     last_video_at = 0.0
     last_report_at = time.monotonic()
-    last_sample: PointerSample | None = None
     read_failures = 0
 
     while True:
@@ -275,40 +405,24 @@ async def stream(
         sent_video = False
 
         if now - last_telemetry_at >= settings.telemetry_interval:
-            landmarks = await asyncio.to_thread(tracker.detect, frame)
-            sample = pointer_sample(landmarks, frame.shape, detector)
+            hands = await asyncio.to_thread(tracker.detect, frame)
+            sample = rig.update(hands, frame.shape)
             last_telemetry_at = now
 
             if sample is not None:
-                last_sample = sample
                 telemetry_seq += 1
                 telemetry_sent += 1
                 await websocket.send(json.dumps(telemetry_frame(sample, telemetry_seq)))
                 sent_telemetry = True
                 LOG.debug(
-                    "hand x=%.3f y=%.3f pinch=%s ratio=%.3f (%.1fpx)",
+                    "hands x=%.3f y=%.3f pinch=%s x2=%s y2=%s pinch2=%s",
                     sample.x,
                     sample.y,
                     sample.pinch_active,
-                    sample.pinch_ratio,
-                    sample.pinch_distance_px,
+                    None if sample.x2 is None else round(sample.x2, 3),
+                    None if sample.y2 is None else round(sample.y2, 3),
+                    sample.pinch2_active,
                 )
-            elif detector.active and last_sample is not None:
-                # The hand left while pinching: release at the last known point so
-                # viewers do not keep a stuck pinch.
-                detector.reset()
-                released = PointerSample(
-                    x=last_sample.x,
-                    y=last_sample.y,
-                    pinch_active=False,
-                    pinch_ratio=last_sample.pinch_ratio,
-                    pinch_distance_px=last_sample.pinch_distance_px,
-                )
-                telemetry_seq += 1
-                telemetry_sent += 1
-                await websocket.send(json.dumps(telemetry_frame(released, telemetry_seq)))
-                sent_telemetry = True
-                LOG.debug("hand lost; released pinch at %.3f,%.3f", released.x, released.y)
 
         now = time.monotonic()
         if now - last_video_at >= settings.video_interval:
@@ -325,7 +439,7 @@ async def stream(
                 video_sent,
                 settings.telemetry_fps,
                 settings.video_fps,
-                detector.active,
+                rig.any_pinch,
             )
             last_report_at = now
 
@@ -375,17 +489,17 @@ async def run(args: argparse.Namespace) -> None:
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
     )
-    detector = PinchDetector(args.pinch_engage, args.pinch_release)
+    rig = HandRig(args.pinch_engage, args.pinch_release)
     settings = StreamSettings(args.telemetry_fps, args.video_fps, args.jpeg_quality)
     LOG.info(
-        "camera %d at %dx%d, telemetry %g fps, video %g fps, pinch %.2f..%.2f",
+        "camera %d at %dx%d, telemetry %g fps, video %g fps, two hands, pinch %.2f..%.2f",
         args.camera,
         args.width,
         args.height,
         settings.telemetry_fps,
         settings.video_fps,
-        detector.engage,
-        detector.release,
+        rig.engage,
+        rig.release,
     )
 
     try:
@@ -395,7 +509,7 @@ async def run(args: argparse.Namespace) -> None:
                     LOG.info("connected to %s", args.server)
                     reader = asyncio.create_task(log_server_frames(websocket))
                     try:
-                        await stream(websocket, camera, tracker, detector, settings)
+                        await stream(websocket, camera, tracker, rig, settings)
                     finally:
                         reader.cancel()
                         with contextlib.suppress(asyncio.CancelledError):

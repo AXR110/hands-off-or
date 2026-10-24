@@ -113,6 +113,18 @@
           "type": "boolean",
           "description": "true while the pointer is pinching (finger down / drag engaged)."
         },
+        "x2": {
+          "oneOf": [{ "$ref": "#/$defs/unitFloat" }, { "type": "null" }],
+          "description": "Second hand's horizontal position. Null when only one hand is tracked. Sent together with y2 and pinch2_active."
+        },
+        "y2": {
+          "oneOf": [{ "$ref": "#/$defs/unitFloat" }, { "type": "null" }],
+          "description": "Second hand's vertical position. Null when only one hand is tracked."
+        },
+        "pinch2_active": {
+          "oneOf": [{ "type": "boolean" }, { "type": "null" }],
+          "description": "true while the second hand is pinching. Null when only one hand is tracked."
+        },
         "ts": {
           "oneOf": [{ "$ref": "#/$defs/epochMillis" }, { "type": "null" }],
           "description": "Optional client capture timestamp; the server reports it back as client_ts."
@@ -143,6 +155,16 @@
         "x": { "$ref": "#/$defs/unitFloat" },
         "y": { "$ref": "#/$defs/unitFloat" },
         "pinch_active": { "type": "boolean" },
+        "x2": {
+          "oneOf": [{ "$ref": "#/$defs/unitFloat" }, { "type": "null" }],
+          "description": "Second hand's horizontal position, null when only one hand is tracked."
+        },
+        "y2": {
+          "oneOf": [{ "$ref": "#/$defs/unitFloat" }, { "type": "null" }]
+        },
+        "pinch2_active": {
+          "oneOf": [{ "type": "boolean" }, { "type": "null" }]
+        },
         "source": { "$ref": "#/$defs/clientId" },
         "seq": {
           "type": "integer",
