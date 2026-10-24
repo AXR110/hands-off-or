@@ -19,6 +19,8 @@ type StudyId = (typeof STUDIES)[number]["id"];
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
 const ZOOM_START_PX = 48;
+const DOUBLE_PINCH_MS = 650;
+const DOUBLE_PINCH_SLOP_PX = 140;
 
 type Point = { x: number; y: number };
 
@@ -27,6 +29,12 @@ type ZoomGesture = {
   scale: number;
   anchorX: number;
   anchorY: number;
+};
+
+type PinchMark = {
+  at: number;
+  x: number;
+  y: number;
 };
 
 type ImageLayout = {
@@ -311,6 +319,8 @@ export default function SurgicalDashboard() {
   const pinchEdge = useRef({ primary: false, secondary: false });
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
+  const lastPrimaryPinch = useRef<PinchMark | null>(null);
+  const lastSecondaryPinch = useRef<PinchMark | null>(null);
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -347,14 +357,8 @@ export default function SurgicalDashboard() {
         y <= EDGE_WARNING_THRESHOLD ||
         y >= 1 - EDGE_WARNING_THRESHOLD,
     );
-  const edgeGlow = cursorNearEdge
-    ? "opacity-100 from-red-400/25 via-red-500/10"
-    : handDetected
-      ? "opacity-100 from-sky-400/20 via-sky-500/8"
-      : "opacity-0";
-  const edgeShadow = cursorNearEdge
-    ? "shadow-[inset_0_0_32px_-18px_rgba(248,113,113,0.85)]"
-    : "shadow-[inset_0_0_32px_-18px_rgba(56,189,248,0.7)]";
+  const frameFade = cursorNearEdge ? "rgba(248, 113, 113, 0.22)" : "rgba(56, 189, 248, 0.18)";
+  const frameEdge = cursorNearEdge ? "rgba(248, 113, 113, 0.32)" : "rgba(125, 211, 252, 0.28)";
 
   const focusStudy = (id: StudyId | null) => {
     if (!id) return;
@@ -364,6 +368,71 @@ export default function SurgicalDashboard() {
     panRef.current = { x: 0, y: 0 };
     setScale(MIN_ZOOM);
     setPan({ x: 0, y: 0 });
+  };
+
+  const showView = (next: { scale: number; x: number; y: number }) => {
+    const nextPan = { x: next.x, y: next.y };
+    scaleRef.current = next.scale;
+    panRef.current = nextPan;
+    setScale(next.scale);
+    setPan(nextPan);
+  };
+
+  const zoomFullyAt = (x: number, y: number) => {
+    const stage = stageRef.current?.getBoundingClientRect();
+    const layout = imageRef.current ? imageLayout(imageRef.current) : null;
+    if (!stage || !layout || stage.width <= 0 || stage.height <= 0) return false;
+    const px = x * window.innerWidth;
+    const py = y * window.innerHeight;
+    const overStage =
+      px >= stage.left && px <= stage.right && py >= stage.top && py <= stage.bottom;
+    if (!overStage) return false;
+    zoomGesture.current = null;
+    if (scaleRef.current >= MAX_ZOOM - 0.05) {
+      showView({ scale: MIN_ZOOM, x: 0, y: 0 });
+      return true;
+    }
+    const safeScale = scaleRef.current || MIN_ZOOM;
+    const focal = {
+      x: clamp(px, stage.left, stage.right),
+      y: clamp(py, stage.top, stage.bottom),
+    };
+    showView(
+      zoomAtFocal(
+        {
+          baseline: 1,
+          scale: MAX_ZOOM,
+          anchorX: clamp(
+            (focal.x - layout.centerX - panRef.current.x) / safeScale,
+            -layout.width / 2,
+            layout.width / 2,
+          ),
+          anchorY: clamp(
+            (focal.y - layout.centerY - panRef.current.y) / safeScale,
+            -layout.height / 2,
+            layout.height / 2,
+          ),
+        },
+        focal,
+        1,
+        layout,
+        stage,
+      ),
+    );
+    return true;
+  };
+
+  const onPinchDown = (x: number, y: number, mark: { current: PinchMark | null }) => {
+    const now = performance.now();
+    const prior = mark.current;
+    mark.current = { at: now, x, y };
+    const moved = prior
+      ? Math.hypot((x - prior.x) * window.innerWidth, (y - prior.y) * window.innerHeight)
+      : Number.POSITIVE_INFINITY;
+    const isDouble =
+      prior != null && now - prior.at <= DOUBLE_PINCH_MS && moved <= DOUBLE_PINCH_SLOP_PX;
+    if (isDouble && zoomFullyAt(x, y)) return;
+    focusStudy(studyAtPoint(x, y));
   };
 
   useEffect(() => {
@@ -403,21 +472,16 @@ export default function SurgicalDashboard() {
             };
           }
         } else {
-          const next = zoomAtFocal(zoomGesture.current, focal, distance, layout, stage);
-          const nextPan = { x: next.x, y: next.y };
-          scaleRef.current = next.scale;
-          panRef.current = nextPan;
-          setScale(next.scale);
-          setPan(nextPan);
+          showView(zoomAtFocal(zoomGesture.current, focal, distance, layout, stage));
         }
       }
     } else {
       zoomGesture.current = null;
       if (telemetry.pinch_active && !pinchEdge.current.primary) {
-        focusStudy(studyAtPoint(telemetry.x, telemetry.y));
+        onPinchDown(telemetry.x, telemetry.y, lastPrimaryPinch);
       }
       if (second && pinch2 && !pinchEdge.current.secondary) {
-        focusStudy(studyAtPoint(x2, y2));
+        onPinchDown(x2, y2, lastSecondaryPinch);
       }
     }
 
@@ -574,7 +638,7 @@ export default function SurgicalDashboard() {
                   {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
                 </span>
                 <span className="mt-0.5 block text-[9px] tracking-[0.14em] text-slate-600 uppercase">
-                  Follows both hands
+                  Pinch twice to zoom here
                 </span>
               </span>
             </div>
@@ -683,10 +747,10 @@ export default function SurgicalDashboard() {
         </aside>
       </div>
 
-      {telemetry && (
+      {handDetected && telemetry && (
         <PointerCursor x={telemetry.x} y={telemetry.y} pinched={telemetry.pinch_active} />
       )}
-      {secondHand && telemetry && (
+      {handDetected && secondHand && telemetry && (
         <PointerCursor
           x={telemetry.x2 ?? 0}
           y={telemetry.y2 ?? 0}
@@ -694,20 +758,15 @@ export default function SurgicalDashboard() {
           tone="amber"
         />
       )}
-      <div aria-hidden className="pointer-events-none fixed inset-0 z-40">
-        <span
-          className={`absolute inset-y-0 left-0 w-16 bg-linear-to-r transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
-        />
-        <span
-          className={`absolute inset-y-0 right-0 w-16 bg-linear-to-l transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
-        />
-        <span
-          className={`absolute inset-x-0 top-0 h-16 bg-linear-to-b transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
-        />
-        <span
-          className={`absolute inset-x-0 bottom-0 h-16 bg-linear-to-t transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
-        />
-      </div>
-git     </div>
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-0 z-40 transition-[opacity,box-shadow] duration-500 ease-out"
+        style={{
+          opacity: handDetected ? 1 : 0,
+          background: `radial-gradient(ellipse at center, transparent 46%, ${frameFade} 100%)`,
+          boxShadow: `inset 0 0 110px 24px ${frameEdge}`,
+        }}
+      />
+    </div>
   );
 }
