@@ -5,6 +5,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 const LOG_LIMIT = 50;
 const KNOWN_TOOLS = ["set_pointer", "set_pinch"];
+const HAND_DETECTION_TIMEOUT_MS = 500;
+const EDGE_WARNING_THRESHOLD = 0.06;
 
 type ConnectionStatus = "connecting" | "online" | "reconnecting";
 
@@ -47,6 +49,7 @@ type ToolCall = {
 function useBridge() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
+  const [handDetected, setHandDetected] = useState(false);
   const [calls, setCalls] = useState<ToolCall[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const seenCalls = useRef(new Set<string>());
@@ -54,12 +57,27 @@ function useBridge() {
   useEffect(() => {
     let socket: WebSocket | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let handDetectionTimer: ReturnType<typeof setTimeout> | null = null;
     let attempts = 0;
     let disposed = false;
 
     const url = new URL(BRIDGE_URL);
     url.searchParams.set("role", "viewer");
     url.searchParams.set("client_id", `web-${Math.random().toString(36).slice(2, 8)}`);
+
+    const updateTelemetry = (frame: Telemetry) => {
+      setTelemetry(frame);
+      if (handDetectionTimer) clearTimeout(handDetectionTimer);
+      const age = Math.max(0, Date.now() - frame.server_ts);
+      const freshFor = Math.max(0, HAND_DETECTION_TIMEOUT_MS - age);
+      setHandDetected(freshFor > 0);
+      if (freshFor > 0) {
+        handDetectionTimer = setTimeout(() => {
+          setHandDetected(false);
+          handDetectionTimer = null;
+        }, freshFor);
+      }
+    };
 
     const recordCall = (frame: FunctionCallFrame) => {
       if (seenCalls.current.has(frame.call_id)) return;
@@ -101,9 +119,9 @@ function useBridge() {
           return;
         }
         if (frame.type === "telemetry") {
-          setTelemetry(frame);
+          updateTelemetry(frame);
         } else if (frame.type === "state_snapshot") {
-          if (frame.telemetry) setTelemetry(frame.telemetry);
+          if (frame.telemetry) updateTelemetry(frame.telemetry);
         } else if (frame.type === "function_call") {
           recordCall(frame);
         }
@@ -125,11 +143,12 @@ function useBridge() {
     return () => {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      if (handDetectionTimer) clearTimeout(handDetectionTimer);
       socket?.close();
     };
   }, []);
 
-  return { status, telemetry, calls, counts };
+  return { status, telemetry, handDetected, calls, counts };
 }
 
 function formatClock(timestamp: number) {
@@ -163,7 +182,7 @@ function PointerCursor({ telemetry }: { telemetry: Telemetry | null }) {
 }
 
 export default function SurgicalDashboard() {
-  const { status, telemetry, calls, counts } = useBridge();
+  const { status, telemetry, handDetected, calls, counts } = useBridge();
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -175,6 +194,21 @@ export default function SurgicalDashboard() {
   );
   const maxCount = Math.max(1, ...toolNames.map((name) => counts[name] ?? 0));
   const pinchActive = telemetry?.pinch_active ?? false;
+  const cursorNearEdge =
+    handDetected &&
+    telemetry !== null &&
+    (telemetry.x <= EDGE_WARNING_THRESHOLD ||
+      telemetry.x >= 1 - EDGE_WARNING_THRESHOLD ||
+      telemetry.y <= EDGE_WARNING_THRESHOLD ||
+      telemetry.y >= 1 - EDGE_WARNING_THRESHOLD);
+  const edgeGlow = cursorNearEdge
+    ? "opacity-100 from-red-400/25 via-red-500/10"
+    : handDetected
+      ? "opacity-100 from-sky-400/20 via-sky-500/8"
+      : "opacity-0";
+  const edgeShadow = cursorNearEdge
+    ? "shadow-[inset_0_0_32px_-18px_rgba(248,113,113,0.85)]"
+    : "shadow-[inset_0_0_32px_-18px_rgba(56,189,248,0.7)]";
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[#05070d] text-slate-200">
@@ -366,6 +400,20 @@ export default function SurgicalDashboard() {
         </aside>
       </div>
 
+      <div aria-hidden className="pointer-events-none fixed inset-0 z-40">
+        <span
+          className={`absolute inset-y-0 left-0 w-16 bg-linear-to-r transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
+        />
+        <span
+          className={`absolute inset-y-0 right-0 w-16 bg-linear-to-l transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
+        />
+        <span
+          className={`absolute inset-x-0 top-0 h-16 bg-linear-to-b transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
+        />
+        <span
+          className={`absolute inset-x-0 bottom-0 h-16 bg-linear-to-t transition-all duration-300 ${edgeGlow} ${edgeShadow}`}
+        />
+      </div>
       <PointerCursor telemetry={telemetry} />
     </div>
   );
