@@ -18,8 +18,86 @@ const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
 const ZOOM_START_PX = 48;
 
+type Point = { x: number; y: number };
+
+type ZoomGesture = {
+  baseline: number;
+  scale: number;
+  anchorX: number;
+  anchorY: number;
+};
+
+type ImageLayout = {
+  centerX: number;
+  centerY: number;
+  width: number;
+  height: number;
+};
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function clampZoom(scale: number) {
-  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, scale));
+  return clamp(scale, MIN_ZOOM, MAX_ZOOM);
+}
+
+// Keep the pinched spot fixed. Only stop the film from sliding fully out of view.
+function clampAxis(offset: number, center: number, scaledSize: number, start: number, end: number) {
+  const overlap = Math.min(64, scaledSize, end - start);
+  const lower = start + overlap - center - scaledSize / 2;
+  const upper = end - overlap - center + scaledSize / 2;
+  return clamp(offset, Math.min(lower, upper), Math.max(lower, upper));
+}
+
+function imageLayout(image: HTMLElement): ImageLayout | null {
+  const width = image.offsetWidth;
+  const height = image.offsetHeight;
+  const parent = image.offsetParent;
+  if (!(parent instanceof HTMLElement) || width < 1 || height < 1) return null;
+  const parentRect = parent.getBoundingClientRect();
+  return {
+    centerX: parentRect.left + parent.clientLeft + image.offsetLeft + width / 2,
+    centerY: parentRect.top + parent.clientTop + image.offsetTop + height / 2,
+    width,
+    height,
+  };
+}
+
+function focalInStage(x: number, y: number, x2: number, y2: number, stage: DOMRect): Point {
+  return {
+    x: clamp(((x + x2) / 2) * window.innerWidth, stage.left, stage.right),
+    y: clamp(((y + y2) / 2) * window.innerHeight, stage.top, stage.bottom),
+  };
+}
+
+// Scale around the content point under the pinch, and follow that point if it moves.
+function zoomAtFocal(
+  gesture: ZoomGesture,
+  focal: Point,
+  distance: number,
+  layout: ImageLayout,
+  stage: DOMRect,
+) {
+  const scale = clampZoom(gesture.scale * (distance / gesture.baseline));
+  if (scale <= MIN_ZOOM) return { scale: MIN_ZOOM, x: 0, y: 0 };
+  return {
+    scale,
+    x: clampAxis(
+      focal.x - layout.centerX - gesture.anchorX * scale,
+      layout.centerX,
+      layout.width * scale,
+      stage.left,
+      stage.right,
+    ),
+    y: clampAxis(
+      focal.y - layout.centerY - gesture.anchorY * scale,
+      layout.centerY,
+      layout.height * scale,
+      stage.top,
+      stage.bottom,
+    ),
+  };
 }
 
 function studyAtPoint(x: number, y: number): StudyId | null {
@@ -206,10 +284,14 @@ export default function SurgicalDashboard() {
   const { status, telemetry, calls, counts } = useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
   const [scale, setScale] = useState(MIN_ZOOM);
+  const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [hovered, setHovered] = useState<StudyId | null>(null);
   const scaleRef = useRef(MIN_ZOOM);
-  const zoomGesture = useRef<{ baseline: number; scale: number } | null>(null);
+  const panRef = useRef<Point>({ x: 0, y: 0 });
+  const zoomGesture = useRef<ZoomGesture | null>(null);
   const pinchEdge = useRef({ primary: false, secondary: false });
+  const stageRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -233,8 +315,11 @@ export default function SurgicalDashboard() {
   const focusStudy = (id: StudyId | null) => {
     if (!id) return;
     setSelected(id);
+    zoomGesture.current = null;
     scaleRef.current = MIN_ZOOM;
+    panRef.current = { x: 0, y: 0 };
     setScale(MIN_ZOOM);
+    setPan({ x: 0, y: 0 });
   };
 
   useEffect(() => {
@@ -251,16 +336,36 @@ export default function SurgicalDashboard() {
         (x2 - telemetry.x) * window.innerWidth,
         (y2 - telemetry.y) * window.innerHeight,
       );
-      if (!zoomGesture.current) {
-        if (distance >= ZOOM_START_PX) {
-          zoomGesture.current = { baseline: distance, scale: scaleRef.current };
+      const stage = stageRef.current?.getBoundingClientRect();
+      const layout = imageRef.current ? imageLayout(imageRef.current) : null;
+      if (stage && layout && stage.width > 0 && stage.height > 0) {
+        const focal = focalInStage(telemetry.x, telemetry.y, x2, y2, stage);
+        if (!zoomGesture.current) {
+          if (distance >= ZOOM_START_PX) {
+            const safeScale = scaleRef.current || MIN_ZOOM;
+            zoomGesture.current = {
+              baseline: distance,
+              scale: safeScale,
+              anchorX: clamp(
+                (focal.x - layout.centerX - panRef.current.x) / safeScale,
+                -layout.width / 2,
+                layout.width / 2,
+              ),
+              anchorY: clamp(
+                (focal.y - layout.centerY - panRef.current.y) / safeScale,
+                -layout.height / 2,
+                layout.height / 2,
+              ),
+            };
+          }
+        } else {
+          const next = zoomAtFocal(zoomGesture.current, focal, distance, layout, stage);
+          const nextPan = { x: next.x, y: next.y };
+          scaleRef.current = next.scale;
+          panRef.current = nextPan;
+          setScale(next.scale);
+          setPan(nextPan);
         }
-      } else {
-        const next = clampZoom(
-          zoomGesture.current.scale * (distance / zoomGesture.current.baseline),
-        );
-        scaleRef.current = next;
-        setScale(next);
       }
     } else {
       zoomGesture.current = null;
@@ -415,28 +520,37 @@ export default function SurgicalDashboard() {
           </nav>
 
           <section className="flex h-full min-h-[320px] min-w-0 flex-1 flex-col overflow-hidden bg-[#060a12] md:m-3 md:rounded-xl md:border md:border-slate-800/80 md:shadow-[inset_0_0_120px_rgba(14,165,233,0.06)]">
-            <div className="flex items-center justify-between border-b border-slate-800/70 px-4 py-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-slate-800/70 px-4 py-2.5">
               <div className="flex items-center gap-2 text-[10px] tracking-[0.22em] text-slate-500 uppercase">
                 <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
                 {study.label} study
               </div>
-              <span className="font-mono text-[10px] tracking-wider text-slate-400">
-                {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
+              <span className="text-right">
+                <span className="block font-mono text-[10px] tracking-wider text-slate-400">
+                  {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
+                </span>
+                <span className="mt-0.5 block text-[9px] tracking-[0.14em] text-slate-600 uppercase">
+                  Follows both hands
+                </span>
               </span>
             </div>
 
-            <div className="scan-grid relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_50%_45%,rgba(14,165,233,0.10),transparent_60%)]">
+            <div
+              ref={stageRef}
+              className="scan-grid relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_50%_45%,rgba(14,165,233,0.10),transparent_60%)]"
+            >
               <span className="pointer-events-none absolute top-4 left-4 h-6 w-6 border-t-2 border-l-2 border-sky-500/30" />
               <span className="pointer-events-none absolute top-4 right-4 h-6 w-6 border-t-2 border-r-2 border-sky-500/30" />
               <span className="pointer-events-none absolute bottom-4 left-4 h-6 w-6 border-b-2 border-l-2 border-sky-500/30" />
               <span className="pointer-events-none absolute right-4 bottom-4 h-6 w-6 border-b-2 border-r-2 border-sky-500/30" />
 
               <img
+                ref={imageRef}
                 src={study.src}
                 alt={`${study.label} X-ray`}
                 draggable={false}
-                className="max-h-full max-w-full object-contain select-none"
-                style={{ transform: `scale(${scale})` }}
+                className="max-h-full max-w-full origin-center object-contain select-none"
+                style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}
               />
             </div>
           </section>
