@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import itertools
 import json
 import logging
@@ -48,7 +49,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Iterable, Literal
 
+import gemini_live
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from tools import ToolError, dispatch, interpret_log_command
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -83,6 +86,7 @@ SCHEMA_PATH = Path(__file__).with_name("shared_schema.json")
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
 GEMINI_TOOLS: list[dict[str, Any]] = SCHEMA["x-gemini"]["tools"]
 TOOL_NAMES = frozenset(tool["name"] for tool in GEMINI_TOOLS)
+TRAY_TOOLS = frozenset({"log_instrument", "verify_tray_count"})
 
 ROLES = ("input", "viewer", "gemini")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -185,6 +189,15 @@ class FunctionResultFrame(BaseModel):
         if not self.ok and self.error is None:
             raise ValueError("ok=false requires error{code,message}")
         return self
+
+
+class VoiceStatusFrame(BaseModel):
+    """input -> server: microphone is open and the wake listener is running."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["voice_status"] = "voice_status"
+    active: bool = True
 
 
 class SpeechLogFrame(BaseModel):
@@ -464,7 +477,61 @@ async def handle_telemetry(client: Client, frame: TelemetryFrame) -> None:
     await bridge.broadcast(event, exclude=client.id)
 
 
+async def execute_tray_tool(
+    name: str,
+    args: dict[str, Any],
+    call_id: str,
+    *,
+    origin: str,
+) -> dict[str, Any]:
+    """Run a tray tool and fan the call plus its result out to viewers."""
+    error: dict[str, str] | None = None
+    result: dict[str, Any] | None = None
+    try:
+        result = dispatch(name, args)
+        ok = True
+        LOG.info("tool %s ok", name)
+    except ToolError as exc:
+        ok = False
+        error = {"code": exc.code, "message": exc.message}
+        LOG.info("tool %s rejected: %s", name, exc.message)
+    except Exception as exc:
+        ok = False
+        error = {"code": "internal", "message": str(exc) or "tool failed"}
+        LOG.exception("tool %s failed", name)
+    call = {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "args": args,
+        "origin": origin,
+        "server_ts": _now_ms(),
+    }
+    result_frame: dict[str, Any] = {
+        "type": "function_result",
+        "call_id": call_id,
+        "name": name,
+        "ok": ok,
+        "result": result,
+        "error": error,
+        "origin": "server",
+        "server_ts": _now_ms(),
+    }
+    await bridge.broadcast(call, roles={"viewer"})
+    await bridge.broadcast(result_frame, roles={"viewer"})
+    return result_frame
+
+
+async def log_spoken_command(text: str) -> None:
+    """Store a transcript as tray tool calls when Gemini Live is not in the session."""
+    for name, args in interpret_log_command(text):
+        await execute_tray_tool(name, args, uuid.uuid4().hex, origin="server")
+
+
 async def handle_function_call(client: Client, frame: FunctionCallFrame) -> None:
+    if frame.name in TRAY_TOOLS:
+        await execute_tray_tool(frame.name, frame.args, frame.call_id, origin=_origin(client.role))
+        return
     call = {
         "type": "function_call",
         "call_id": frame.call_id,
@@ -520,6 +587,26 @@ async def handle_speech_log(client: Client, frame: SpeechLogFrame) -> None:
         "server_ts": _now_ms(),
     }
     await bridge.broadcast(event, exclude=client.id)
+    if frame.phase == "final" and not gemini_live.is_active():
+        await log_spoken_command(frame.text)
+
+
+async def handle_voice_status(client: Client, frame: VoiceStatusFrame) -> None:
+    if client.role != "input":
+        await send_protocol_error(
+            client, "forbidden_role", "voice_status is only accepted from an input client"
+        )
+        return
+    await bridge.broadcast(
+        {
+            "type": "voice_status",
+            "active": frame.active,
+            "source": client.id,
+            "server_ts": _now_ms(),
+        },
+        exclude=client.id,
+        roles={"viewer"},
+    )
 
 
 async def handle_text(client: Client, raw: str) -> None:
@@ -545,6 +632,8 @@ async def handle_text(client: Client, raw: str) -> None:
             await handle_video_frame(client, VideoFrame.model_validate(payload))
         elif kind == "speech_log":
             await handle_speech_log(client, SpeechLogFrame.model_validate(payload))
+        elif kind == "voice_status":
+            await handle_voice_status(client, VoiceStatusFrame.model_validate(payload))
         elif kind == "start_recording":
             if client.role == "viewer":
                 await bridge.broadcast({"type": "start_recording"}, exclude=client.id, roles={"input"})
@@ -628,6 +717,37 @@ async def snapshot_payload() -> dict[str, Any]:
 # --- application -----------------------------------------------------------
 
 
+async def _drain_audio() -> list[bytes]:
+    chunks = await media_store.get("audio").drain()
+    return [chunk.data for chunk in chunks]
+
+
+async def _on_gemini_tool_call(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    responses: list[dict[str, Any]] = []
+    for call in calls:
+        name = call.get("name")
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            call_id = uuid.uuid4().hex
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        if not isinstance(name, str) or name not in TRAY_TOOLS:
+            responses.append(
+                {
+                    "id": call_id,
+                    "name": name if isinstance(name, str) else "unknown",
+                    "response": {"error": f"unsupported tool {name!r}"},
+                }
+            )
+            continue
+        frame = await execute_tray_tool(name, args, call_id, origin="gemini")
+        if frame["ok"]:
+            response: dict[str, Any] = {"result": frame["result"]}
+        else:
+            response = {"error": (frame.get("error") or {}).get("message", "tool failed")}
+        responses.append({"id": call_id, "name": name, "response": response})
+    return responses
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     LOG.info(
@@ -637,7 +757,16 @@ async def lifespan(_: FastAPI):
         AUDIO_BUFFER_BYTES,
         MAX_CHUNKS_PER_CHANNEL,
     )
-    yield
+    live = asyncio.create_task(
+        gemini_live.supervise(_drain_audio, _on_gemini_tool_call),
+        name="gemini-live",
+    )
+    try:
+        yield
+    finally:
+        live.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await live
 
 
 app = FastAPI(

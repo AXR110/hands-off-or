@@ -16,10 +16,15 @@ class TestSpeechLogRelay(unittest.TestCase):
             async def viewer_send(data):
                 viewer_frames.append(json.loads(data))
 
-            fake_ws_voice = type('obj', (object,), {'send_text': voice_send})()
-            fake_ws_viewer = type('obj', (object,), {'send_text': viewer_send})()
-            voice_client = Client("voice-1", "input", fake_ws_voice, 0)
-            viewer_client = Client("viewer-1", "viewer", fake_ws_viewer, 0)
+            class Socket:
+                def __init__(self, send):
+                    self._send = send
+
+                async def send_text(self, data):
+                    await self._send(data)
+
+            voice_client = Client("voice-1", "input", Socket(voice_send), 0)
+            viewer_client = Client("viewer-1", "viewer", Socket(viewer_send), 0)
 
             await bridge.add(voice_client)
             await bridge.add(viewer_client)
@@ -70,6 +75,39 @@ class TestSpeechLogRelay(unittest.TestCase):
             finally:
                 await bridge.remove("voice-1")
                 await bridge.remove("viewer-1")
+
+        asyncio.run(run_test())
+
+    def test_voice_status_reaches_viewers(self):
+        async def run_test():
+            viewer_frames = []
+
+            async def viewer_send(data):
+                viewer_frames.append(json.loads(data))
+
+            async def ignore(_data):
+                return None
+
+            class Socket:
+                def __init__(self, send):
+                    self._send = send
+
+                async def send_text(self, data):
+                    await self._send(data)
+
+            voice = Client("voice-status", "input", Socket(ignore), 0)
+            viewer = Client("viewer-status", "viewer", Socket(viewer_send), 0)
+            await bridge.add(voice)
+            await bridge.add(viewer)
+            try:
+                await handle_text(voice, json.dumps({"type": "voice_status", "active": True}))
+            finally:
+                await bridge.remove("voice-status")
+                await bridge.remove("viewer-status")
+            status = [frame for frame in viewer_frames if frame.get("type") == "voice_status"]
+            self.assertEqual(len(status), 1, viewer_frames)
+            self.assertTrue(status[0]["active"])
+            self.assertEqual(status[0]["source"], "voice-status")
 
         asyncio.run(run_test())
 

@@ -6,4 +6,5 @@ opencv-contrib-python>=4.10,<6.0
 numpy>=1.26,<3.0
 websockets>=13,<18
 SpeechRecognition>=3.14,<4
+sounddevice>=0.5,<1.0
 audioop-lts>=0.2.1; python_version >= "3.13"

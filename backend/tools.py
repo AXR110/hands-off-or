@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -318,6 +319,146 @@ def dispatch(name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         raise ToolError("invalid_args", "missing arguments: " + ", ".join(missing))
     bound = {key: args[key] for key in params if key in args}
     return handler(**bound)
+
+
+_NUMBER_WORDS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+_ACTION_WORDS = {
+    "add": "added",
+    "added": "added",
+    "adding": "added",
+    "remove": "removed",
+    "removed": "removed",
+    "removing": "removed",
+    "take": "removed",
+    "took": "removed",
+    "use": "used",
+    "used": "used",
+    "using": "used",
+}
+_VERIFY_WORDS = {"verify", "confirm", "reconcile", "check"}
+_VERIFY_SKIP = {"tray", "count", "the", "total", "instruments", "instrument", "of"}
+_FILLER = {"please", "um", "uh"}
+_CLAUSE_SPLIT = re.compile(r"\s+and\s+", re.IGNORECASE)
+
+
+def _number_token(word: str) -> int | None:
+    if word.isdigit():
+        return int(word)
+    return _NUMBER_WORDS.get(word)
+
+
+def _parse_verify_clause(tokens: list[str]) -> tuple[str, dict[str, Any]] | None:
+    numbers: list[int] = []
+    name: list[str] = []
+    for token in tokens:
+        word = token.strip(".,").casefold()
+        raw = token.strip(".,")
+        if not word or word in _VERIFY_SKIP:
+            continue
+        number = _number_token(word)
+        if number is not None:
+            numbers.append(number)
+            continue
+        name.append(raw)
+    if not numbers:
+        return None
+    args: dict[str, Any] = {"expected_count": numbers[-1]}
+    if name:
+        args["instrument"] = " ".join(name)
+    return ("verify_tray_count", args)
+
+
+def _parse_log_clause(tokens: list[str]) -> tuple[str, dict[str, Any]] | None:
+    action = "added"
+    quantity: int | None = None
+    name: list[str] = []
+    for token in tokens:
+        word = token.strip(".,").casefold()
+        raw = token.strip(".,")
+        if not word or (word in _FILLER and not name):
+            continue
+        if word in _ACTION_WORDS and not name:
+            action = _ACTION_WORDS[word]
+            continue
+        number = _number_token(word)
+        if number is not None and quantity is None and not name:
+            quantity = number
+            continue
+        name.append(raw)
+    instrument = " ".join(name).strip()
+    if not instrument:
+        return None
+    return (
+        "log_instrument",
+        {"instrument": instrument, "action": action, "quantity": quantity or 1},
+    )
+
+
+def interpret_log_command(text: str) -> list[tuple[str, dict[str, Any]]]:
+    """Turn a wake-word remainder into tray tool calls.
+
+    ``"add sponge and two clamps"`` becomes two ``log_instrument`` calls.
+    ``"verify 12"`` becomes ``verify_tray_count``. Unrecognized text is ignored.
+    """
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return []
+    calls: list[tuple[str, dict[str, Any]]] = []
+    for clause in _CLAUSE_SPLIT.split(cleaned):
+        tokens = clause.strip(" ,.;").split()
+        if not tokens:
+            continue
+        head = tokens[0].strip(".,").casefold()
+        parsed = (
+            _parse_verify_clause(tokens[1:])
+            if head in _VERIFY_WORDS
+            else _parse_log_clause(tokens)
+        )
+        if parsed is not None:
+            calls.append(parsed)
+    return calls
+
+
+def live_function_declarations() -> list[dict[str, Any]]:
+    """Declarations shaped for a Gemini Live setup message.
+
+    Constraint keywords such as ``minimum`` stay in the Python validators.
+    Live setup uses the smaller declaration subset the session accepts, and
+    blocking behavior so the model waits for the tool result.
+    """
+    declarations: list[dict[str, Any]] = []
+    for source in (LOG_INSTRUMENT_DECLARATION, VERIFY_TRAY_COUNT_DECLARATION):
+        declaration = json.loads(json.dumps(source))
+        _strip_schema_constraints(declaration.get("parameters"))
+        declaration["behavior"] = "BLOCKING"
+        declarations.append(declaration)
+    return declarations
+
+
+def _strip_schema_constraints(schema: Any) -> None:
+    if not isinstance(schema, dict):
+        return
+    for key in ("minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems"):
+        schema.pop(key, None)
+    for value in schema.values():
+        if isinstance(value, dict):
+            _strip_schema_constraints(value)
+        elif isinstance(value, list):
+            for item in value:
+                _strip_schema_constraints(item)
 
 
 def _check_shared_schema() -> None:
