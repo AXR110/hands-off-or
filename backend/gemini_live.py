@@ -70,12 +70,14 @@ def _model_name() -> str:
     return f"models/{model}"
 
 
-def _setup_message() -> dict[str, Any]:
+def _setup_message(system_instruction: str | None = None) -> dict[str, Any]:
+    provided = system_instruction.strip() if system_instruction else ""
+    instruction = provided or SYSTEM_INSTRUCTION
     return {
         "setup": {
             "model": _model_name(),
             "generationConfig": {"responseModalities": ["AUDIO"]},
-            "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+            "systemInstruction": {"parts": [{"text": instruction}]},
             "tools": [{"functionDeclarations": live_function_declarations()}],
         }
     }
@@ -150,12 +152,17 @@ async def _receive(websocket: Any, on_tool_call: ToolHandler, ready: asyncio.Eve
             await websocket.send(json.dumps({"toolResponse": {"functionResponses": responses}}))
 
 
-async def session(drain: AudioDrain, on_tool_call: ToolHandler, key: str) -> None:
+async def session(
+    drain: AudioDrain,
+    on_tool_call: ToolHandler,
+    key: str,
+    system_instruction: str | None = None,
+) -> None:
     """One Live socket: setup, then audio in and tool calls out."""
     global _active
     ready = asyncio.Event()
     async with connect(f"{LIVE_URL}?key={key}", max_size=None, ping_interval=20) as websocket:
-        await websocket.send(json.dumps(_setup_message()))
+        await websocket.send(json.dumps(_setup_message(system_instruction)))
         try:
             async with asyncio.TaskGroup() as tasks:
                 tasks.create_task(_pump_audio(websocket, drain, ready), name="gemini-audio")
@@ -164,7 +171,11 @@ async def session(drain: AudioDrain, on_tool_call: ToolHandler, key: str) -> Non
             _active = False
 
 
-async def supervise(drain: AudioDrain, on_tool_call: ToolHandler) -> None:
+async def supervise(
+    drain: AudioDrain,
+    on_tool_call: ToolHandler,
+    system_instruction: str | None = None,
+) -> None:
     """Reconnect the Live session until cancelled. Idle when no API key is set."""
     key = api_key()
     if not key:
@@ -175,7 +186,7 @@ async def supervise(drain: AudioDrain, on_tool_call: ToolHandler) -> None:
         return
     while True:
         try:
-            await session(drain, on_tool_call, key)
+            await session(drain, on_tool_call, key, system_instruction)
             LOG.warning("gemini live session closed; reconnecting in %.0fs", RECONNECT_DELAY_S)
         except asyncio.CancelledError:
             raise

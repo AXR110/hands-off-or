@@ -18,8 +18,9 @@ bridge relays back are executed with ``tools.dispatch`` and answered with a
 which is what the surgical log renders.
 
 Run with ``python voice.py`` from this directory (the server defaults to
-port 8000). Microphone capture uses sounddevice, which opens the default
-input as 16 kHz mono PCM16 without PyAudio.
+port 8000). Capture opens the built-in MacBook microphone through sounddevice
+at that device's native 48000 Hz or 44100 Hz, falling back to 16 kHz. The
+socket payload stays 16 kHz mono PCM16, which is what Gemini Live consumes.
 """
 
 from __future__ import annotations
@@ -71,8 +72,14 @@ LOG = logging.getLogger("voice")
 
 # Binary frame layout shared with server.py: frame[0] is the channel tag.
 AUDIO_CHANNEL_TAG = 0x02
+# Wire rate for the bridge and Gemini Live. The capture stream uses the
+# Mac's native rate instead; opening PyAudio at 16 kHz crashes the built-in mic.
 SAMPLE_RATE = 16_000
+MAC_NATIVE_SAMPLE_RATES = (48_000, 44_100)
 SAMPLE_WIDTH = 2  # PCM16, little-endian
+# Fixed gate. A loud floor plus dynamic adjustment climbs above a speaking voice.
+ENERGY_THRESHOLD = 300
+AMBIENT_CALIBRATION_S = 1.5
 COMMAND_WINDOW_S = 6.0
 RECONNECT_DELAY_S = 2.0
 LISTEN_TIMEOUT_S = 1.0
@@ -206,9 +213,118 @@ def list_input_devices() -> list[tuple[int, str]]:
     return found
 
 
+def _builtin_microphone_rank(name: str) -> int | None:
+    """Lower rank is a better match. ``None`` means this is not the built-in array."""
+    lowered = name.casefold()
+    if any(skip in lowered for skip in ("speaker", "iphone", "airpod", "bluetooth")):
+        return None
+    if "macbook" in lowered and "microphone" in lowered:
+        return 0
+    if lowered in {"built-in microphone", "built in microphone", "builtin microphone"} or (
+        "built-in" in lowered and "microphone" in lowered
+    ):
+        return 1
+    return None
+
+
+def _device_names() -> list[str]:
+    """sounddevice names. The index matches ``SoundDeviceMicrophone(device_index=...)``."""
+    return [str(device["name"]) for device in sd.query_devices()]
+
+
+def select_builtin_microphone_index(names: Sequence[str | None] | None = None) -> int:
+    """Index of the MacBook built-in microphone.
+
+    The default input on a laptop with Continuity can be a phone mic, which
+    drops the room audio. Names come from sounddevice so the index can be
+    opened without PyAudio.
+    """
+    if names is None:
+        names = _device_names()
+    ranked: list[tuple[int, int]] = []
+    for index, name in enumerate(names):
+        if not name:
+            continue
+        rank = _builtin_microphone_rank(name)
+        if rank is not None:
+            ranked.append((rank, index))
+    if not ranked:
+        listed = ", ".join(f"{index}: {name}" for index, name in enumerate(names)) or "none"
+        raise ValueError(f"built-in MacBook microphone not found among: {listed}")
+    ranked.sort()
+    return ranked[0][1]
+
+
+def match_native_sample_rate(reported_rate: float) -> int:
+    """Snap a device rate to 48000 or 44100.
+
+    Those are the rates the Mac built-in array actually runs. Asking PyAudio
+    for 16000 raises an invalid-sample-rate error and the stream never opens.
+    """
+    rate = int(round(float(reported_rate)))
+    if rate in MAC_NATIVE_SAMPLE_RATES:
+        return rate
+    return MAC_NATIVE_SAMPLE_RATES[0]
+
+
+def _candidate_sample_rates(reported_rate: float) -> tuple[int, int]:
+    primary = match_native_sample_rate(reported_rate)
+    secondary = 44_100 if primary == 48_000 else 48_000
+    return primary, secondary
+
+
+def _capture_rates(reported_rate: float) -> tuple[int, ...]:
+    """Native Mac rate first, then 16 kHz, which sounddevice can resample."""
+    rates: list[int] = []
+    for rate in (*_candidate_sample_rates(reported_rate), SAMPLE_RATE):
+        if rate not in rates:
+            rates.append(rate)
+    return tuple(rates)
+
+
+def open_microphone(device_index: int | None = None) -> SoundDeviceMicrophone:
+    """Open the built-in MacBook mic, or ``device_index`` when one was passed.
+
+    The app environment does not install PyAudio. sounddevice opens the same
+    Core Audio input and was the path that actually delivered speech.
+    """
+    devices = list(sd.query_devices())
+    index = device_index if device_index is not None else select_builtin_microphone_index()
+    if index < 0 or index >= len(devices):
+        raise ValueError(f"device index {index} is out of range ({len(devices)} devices)")
+    info = devices[index]
+    name = str(info["name"])
+    if int(info["max_input_channels"]) < 1:
+        raise ValueError(f"device {index} ({name}) is not an input")
+    reported = float(info["default_samplerate"])
+    last_error: Exception | None = None
+    for rate in _capture_rates(reported):
+        microphone = SoundDeviceMicrophone(device_index=index, sample_rate=rate)
+        try:
+            with microphone as source:
+                if source.stream is None:
+                    raise OSError(f"microphone stream did not open at {rate} Hz")
+        except (OSError, ValueError, sd.PortAudioError) as exc:
+            last_error = exc
+            LOG.warning("microphone %d %r rejected %d Hz: %s", index, name, rate, exc)
+            continue
+        LOG.info("selected microphone %d %r at %d Hz", index, name, rate)
+        return SoundDeviceMicrophone(device_index=index, sample_rate=rate)
+    raise OSError(f"could not open microphone {index} ({name})") from last_error
+
+
 def _prepare_microphone(recognizer: sr.Recognizer, microphone: sr.AudioSource) -> float:
+    recognizer.dynamic_energy_threshold = False
     with microphone as source:
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        if isinstance(source, (sr.Microphone, SoundDeviceMicrophone)) and source.stream is None:
+            raise OSError(
+                f"microphone stream did not open at {microphone.SAMPLE_RATE} Hz"
+            )
+        recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_CALIBRATION_S)
+    # A loud floor pushes this above a speaking voice. Cap it, and never raise
+    # a quiet-room calibration up to the cap or soft speech is ignored.
+    recognizer.dynamic_energy_threshold = False
+    recognizer.energy_threshold = min(recognizer.energy_threshold, ENERGY_THRESHOLD)
     return recognizer.energy_threshold
 
 
@@ -262,8 +378,16 @@ class WakeListener:
     def _loop_listen(self) -> None:
         try:
             with self._microphone as source:
+                if isinstance(source, (sr.Microphone, SoundDeviceMicrophone)) and source.stream is None:
+                    raise OSError("microphone stream did not open")
                 self.mic_open = True
                 while not self._stop.is_set():
+                    # The record window limits how long we wait for speech to
+                    # start. The phrase itself may end after that deadline.
+                    armed_for_phrase = (
+                        self._command_deadline is not None
+                        and time.monotonic() <= self._command_deadline
+                    )
                     try:
                         audio = self._recognizer.listen(
                             source,
@@ -272,9 +396,15 @@ class WakeListener:
                         )
                     except sr.WaitTimeoutError:
                         self._enqueue_logs(self._speech_log.on_listen_timeout())
+                        if (
+                            self._command_deadline is not None
+                            and time.monotonic() > self._command_deadline
+                        ):
+                            LOG.info("command window elapsed; waiting for the wake word again")
+                            self._command_deadline = None
                         continue
                     try:
-                        self._handle(audio)
+                        self._handle(audio, keep_command=armed_for_phrase)
                     except Exception:
                         LOG.exception("wake listener failed on a phrase")
         except Exception:
@@ -282,9 +412,11 @@ class WakeListener:
         finally:
             self.mic_open = False
 
-    def _handle(self, audio: sr.AudioData) -> None:
+    def _handle(self, audio: sr.AudioData, keep_command: bool = False) -> None:
         now = time.monotonic()
-        armed = self._command_deadline is not None and now <= self._command_deadline
+        armed = keep_command or (
+            self._command_deadline is not None and now <= self._command_deadline
+        )
         if self._command_deadline is not None and not armed:
             LOG.info("command window elapsed; waiting for the wake word again")
             self._command_deadline = None
@@ -293,7 +425,9 @@ class WakeListener:
             transcript = self._recognizer.recognize_google(audio, language=self._language)
         except sr.UnknownValueError:
             if armed:
-                LOG.info("wake word heard, but the command was not understood; still listening")
+                if self._command_deadline is None or time.monotonic() > self._command_deadline:
+                    self._arm()
+                LOG.info("command was not understood; still listening")
             else:
                 LOG.debug("unrecognized speech")
             return
@@ -493,10 +627,11 @@ async def session(
 
 async def run(args: argparse.Namespace) -> None:
     recognizer = sr.Recognizer()
-    recognizer.dynamic_energy_threshold = True
+    recognizer.dynamic_energy_threshold = False
+    recognizer.energy_threshold = ENERGY_THRESHOLD
     try:
-        microphone = SoundDeviceMicrophone(device_index=args.device)
-    except (OSError, ValueError, sd.PortAudioError) as exc:
+        microphone = open_microphone(args.device)
+    except (OSError, ValueError, AssertionError, sd.PortAudioError) as exc:
         raise SystemExit(f"Could not open a microphone. {exc}") from exc
 
     LOG.info("calibrating microphone for ambient noise")
@@ -556,14 +691,19 @@ async def run(args: argparse.Namespace) -> None:
 
 def _list_devices() -> None:
     try:
-        devices = list_input_devices()
+        devices = sd.query_devices()
     except (OSError, sd.PortAudioError) as exc:
         raise SystemExit(f"Could not list microphones. {exc}") from exc
-    if not devices:
+    inputs = [
+        (index, str(device["name"]), int(device["default_samplerate"]))
+        for index, device in enumerate(devices)
+        if int(device["max_input_channels"]) > 0
+    ]
+    if not inputs:
         print("no microphones found")
         return
-    for index, name in devices:
-        print(f"{index}\t{name}")
+    for index, name, rate in inputs:
+        print(f"{index}\t{name}\t{rate} Hz")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -595,7 +735,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--device",
         type=int,
         default=None,
-        help="Microphone index from --list-devices. Defaults to the system microphone.",
+        help="Input device index from --list-devices. Defaults to the built-in MacBook microphone.",
     )
     parser.add_argument(
         "--list-devices",

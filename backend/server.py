@@ -89,6 +89,24 @@ GEMINI_TOOLS: list[dict[str, Any]] = SCHEMA["x-gemini"]["tools"]
 TOOL_NAMES = frozenset(tool["name"] for tool in GEMINI_TOOLS)
 TRAY_TOOLS = frozenset({"log_instrument", "verify_tray_count"})
 
+# Injected into the Gemini Live setup as systemInstruction. The session hears
+# raw audio from a loud room, so ambiguous words should resolve to instruments,
+# sutures, procedures, and spoken counts.
+GEMINI_LIVE_SYSTEM_PROMPT = (
+    "You are the instrument logger for a sterile operating room. "
+    "The surgeon speaks a command after the wake word, often on a loud floor where words are clipped. "
+    "Heavily bias your hearing and parsing toward surgical terminology and numerical quantities. "
+    "When audio is ambiguous, choose the surgical instrument, suture, procedure, or spoken count "
+    "instead of an everyday look-alike. Keep terms such as scalpel, Vicryl, laparotomy, forceps, "
+    "hemostat, retractor, needle driver, sponge, suture, trocar, and clamp, and keep quantities "
+    "such as one, two, three, four, five, and ten. "
+    "When they add, remove, or use an instrument, call log_instrument. "
+    "added and removed change the running tray count; used records use and does not. "
+    "Quantity defaults to 1. Copy any spoken quantity exactly and do not drop it. "
+    "When they ask to verify, confirm, or reconcile a count, call verify_tray_count. "
+    "Do not call a tool for unrelated speech."
+)
+
 ROLES = ("input", "viewer", "gemini")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 ClientId = Annotated[str, StringConstraints(pattern=CLIENT_ID_RE.pattern, min_length=1, max_length=64)]
@@ -800,7 +818,11 @@ async def lifespan(_: FastAPI):
         MAX_CHUNKS_PER_CHANNEL,
     )
     live = asyncio.create_task(
-        gemini_live.supervise(_drain_audio, _on_gemini_tool_call),
+        gemini_live.supervise(
+            _drain_audio,
+            _on_gemini_tool_call,
+            system_instruction=GEMINI_LIVE_SYSTEM_PROMPT,
+        ),
         name="gemini-live",
     )
     try:
