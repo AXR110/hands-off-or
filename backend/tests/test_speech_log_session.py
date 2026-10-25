@@ -115,6 +115,42 @@ class TestSpeechLogSession(unittest.TestCase):
         default_session = SpeechLogSession()
         self.assertEqual(default_session.hear("note this"), [])
 
+    def test_exit_while_idle_does_nothing(self):
+        session = SpeechLogSession()
+        self.assertEqual(session.hear("exit"), [])
+        self.assertEqual(session.hear("log exit"), [])
+        self.assertEqual(session.phase, "idle")
+
+    def test_exit_cancels_an_empty_recording(self):
+        session = SpeechLogSession()
+        session.hear("log")
+        events = session.hear("exit")
+        self.assertEqual(events, [{"type": "speech_log", "phase": "idle", "text": ""}])
+        self.assertEqual(session.phase, "idle")
+        self.assertEqual(session.text, "")
+
+    def test_exit_finalizes_words_already_spoken(self):
+        session = SpeechLogSession()
+        session.hear("log add sponge")
+        events = session.hear("exit")
+        self.assertEqual(events[0], {"type": "speech_log", "phase": "final", "text": "add sponge"})
+        self.assertEqual(events[1], {"type": "speech_log", "phase": "idle", "text": ""})
+        self.assertEqual(session.phase, "idle")
+
+    def test_exit_at_the_end_of_a_phrase_is_not_logged(self):
+        session = SpeechLogSession()
+        session.hear("log")
+        events = session.hear("add sponge exit")
+        self.assertEqual(events[0], {"type": "speech_log", "phase": "final", "text": "add sponge"})
+        self.assertEqual(events[1], {"type": "speech_log", "phase": "idle", "text": ""})
+
+    def test_silence_still_finalizes_after_exit_word_is_not_used(self):
+        session = SpeechLogSession()
+        session.hear("log add sponge")
+        events = session.gap(1.5)
+        self.assertEqual(events[0]["phase"], "final")
+        self.assertEqual(events[0]["text"], "add sponge")
+
     def test_hear_resets_silence_gap(self):
         session = SpeechLogSession()
         session.hear("log add sponge")

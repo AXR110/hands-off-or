@@ -66,7 +66,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from tools import TOOL_NAMES, ToolError, dispatch
-from speech_log import SpeechLogSession
+from speech_log import SpeechLogSession, split_trailing_exit
 
 LOG = logging.getLogger("voice")
 
@@ -85,6 +85,12 @@ RECONNECT_DELAY_S = 2.0
 LISTEN_TIMEOUT_S = 1.0
 QUEUE_SIZE = 8
 VOICE_STATUS_INTERVAL_S = 1.0
+# End the phrase sooner than the library default (0.8s) once the voice stops.
+# Keep the whole utterance: a hard clip shorter than the word drops "log".
+# pause_threshold must stay at least non_speaking_duration.
+PAUSE_THRESHOLD_S = 0.5
+NON_SPEAKING_DURATION_S = 0.3
+PHRASE_THRESHOLD_S = 0.3
 
 _TRAILING_PUNCTUATION = " \t,.!?;:-\"'"
 
@@ -105,6 +111,13 @@ def wake_remainder(transcript: str, wake_word: str) -> str | None:
     if match is None:
         return None
     return transcript[match.end() :].strip(_TRAILING_PUNCTUATION)
+
+
+def utterance_stops_log(transcript: str, wake_word: str) -> tuple[str, bool]:
+    """Command with a trailing ``exit`` removed, and whether that word was spoken."""
+    remainder = wake_remainder(transcript, wake_word)
+    body = transcript if remainder is None else remainder
+    return split_trailing_exit(body)
 
 
 class VoiceSpeechLog:
@@ -313,6 +326,13 @@ def open_microphone(device_index: int | None = None) -> SoundDeviceMicrophone:
     raise OSError(f"could not open microphone {index} ({name})") from last_error
 
 
+def tune_recognizer_for_wake(recognizer: sr.Recognizer) -> None:
+    """Close a short wake word once the voice stops, without clipping it."""
+    recognizer.pause_threshold = PAUSE_THRESHOLD_S
+    recognizer.non_speaking_duration = NON_SPEAKING_DURATION_S
+    recognizer.phrase_threshold = PHRASE_THRESHOLD_S
+
+
 def _prepare_microphone(recognizer: sr.Recognizer, microphone: sr.AudioSource) -> float:
     recognizer.dynamic_energy_threshold = False
     with microphone as source:
@@ -351,6 +371,7 @@ class WakeListener:
         self._queue = queue
         self._log_queue: asyncio.Queue[dict[str, str]] = log_queue or asyncio.Queue()
         self._speech_log = VoiceSpeechLog(wake_word)
+        tune_recognizer_for_wake(recognizer)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._command_deadline: float | None = None
@@ -441,6 +462,15 @@ class WakeListener:
             return
 
         self._enqueue_logs(self._speech_log.on_transcript(transcript))
+
+        command, stopped = utterance_stops_log(transcript, self._wake_word)
+        if stopped:
+            self._command_deadline = None
+            LOG.info("exit heard; stopped listening for the log")
+            remainder = wake_remainder(transcript, self._wake_word)
+            if command and (armed or remainder is not None):
+                self._forward(audio, command)
+            return
 
         if armed:
             self._command_deadline = None

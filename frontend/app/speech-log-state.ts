@@ -11,6 +11,20 @@ export function speechLogStatusLabel(view: SpeechLogView): string {
   return view.recording ? "Recording" : "Listening for log";
 }
 
+/** Oldest saved log is 1. The list itself stays newest-first. */
+export function speechLogChronologicalNumber(entryCount: number, newestFirstIndex: number): number {
+  return entryCount - newestFirstIndex;
+}
+
+export function removeSpeechLogEntry(view: SpeechLogView, index: number): SpeechLogView {
+  if (!Number.isInteger(index) || index < 0 || index >= view.entries.length) return view;
+  return {
+    recording: view.recording,
+    liveText: view.liveText,
+    entries: view.entries.filter((_, entryIndex) => entryIndex !== index),
+  };
+}
+
 export function applySpeechLog(
   view: SpeechLogView,
   frame: any,

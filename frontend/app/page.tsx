@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import ImageViewer from "../components/ImageViewer";
-import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
+import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, speechLogChronologicalNumber, removeSpeechLogEntry, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 
@@ -232,6 +232,15 @@ function fileAddAtPoint(x: number, y: number) {
 
 function recordAtPoint(x: number, y: number) {
   return buttonAtPoint("[data-start-recording]", x, y) != null;
+}
+
+function deleteLogAtPoint(x: number, y: number): HTMLButtonElement | null {
+  return buttonAtPoint("[data-delete-log]", x, y);
+}
+
+function deleteLogHoverId(x: number, y: number): string | null {
+  const index = deleteLogAtPoint(x, y)?.dataset.logIndex;
+  return index == null ? null : `delete-log-${index}`;
 }
 
 function drawModeAtPoint(x: number, y: number) {
@@ -539,6 +548,10 @@ function useBridge() {
     socketRef.current.send(JSON.stringify({ type: "start_recording" }));
   };
 
+  const removeLogEntry = (index: number) => {
+    setSpeechLog((prev) => removeSpeechLogEntry(prev, index));
+  };
+
   const requestImagePick = () => {
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
       return false;
@@ -556,6 +569,7 @@ function useBridge() {
     speechLog,
     voiceLive,
     startRecording,
+    removeLogEntry,
     requestImagePick,
     pickedImagesHandler,
   };
@@ -630,6 +644,7 @@ export default function SurgicalDashboard() {
     speechLog,
     voiceLive,
     startRecording,
+    removeLogEntry,
     requestImagePick,
     pickedImagesHandler,
   } = useBridge();
@@ -960,6 +975,11 @@ export default function SurgicalDashboard() {
   };
 
   const onPinchDown = (x: number, y: number, mark: { current: PinchMark | null }) => {
+    const deleteButton = deleteLogAtPoint(x, y);
+    if (deleteButton) {
+      deleteButton.click();
+      return;
+    }
     const drawButton = buttonAtPoint("[data-draw-mode]", x, y);
     if (drawButton) {
       drawButton.click();
@@ -1133,16 +1153,17 @@ export default function SurgicalDashboard() {
       zoomGesture.current = null;
       swipeGesture.current = null;
       if (!both) {
-        if (primaryDown && filmControlAtPoint(telemetry.x, telemetry.y)) {
-          clickFilmControl(telemetry.x, telemetry.y);
-        }
-        if (
-          secondaryDown &&
-          typeof x2 === "number" &&
-          typeof y2 === "number" &&
-          filmControlAtPoint(x2, y2)
-        ) {
-          clickFilmControl(x2, y2);
+        const pinchControl = (x: number, y: number) => {
+          const deleteButton = deleteLogAtPoint(x, y);
+          if (deleteButton) {
+            deleteButton.click();
+            return;
+          }
+          if (filmControlAtPoint(x, y)) clickFilmControl(x, y);
+        };
+        if (primaryDown) pinchControl(telemetry.x, telemetry.y);
+        if (secondaryDown && typeof x2 === "number" && typeof y2 === "number") {
+          pinchControl(x2, y2);
         }
       }
     } else if (both && second) {
@@ -1230,7 +1251,8 @@ export default function SurgicalDashboard() {
     };
 
     const controlHover = (x: number, y: number) =>
-      fileAddAtPoint(x, y)
+      deleteLogHoverId(x, y) ??
+      (fileAddAtPoint(x, y)
         ? "add-files"
         : recordAtPoint(x, y)
           ? "record"
@@ -1238,7 +1260,7 @@ export default function SurgicalDashboard() {
             ? "draw-mode"
             : clearDrawingAtPoint(x, y)
               ? "clear-drawing"
-              : null;
+              : null);
     const nextHover =
       controlHover(telemetry.x, telemetry.y) ??
       studyAtPoint(telemetry.x, telemetry.y) ??
@@ -1524,6 +1546,9 @@ export default function SurgicalDashboard() {
             <h2 className="text-2xl font-semibold tracking-[0.14em] text-slate-100 uppercase sm:text-3xl">
               Surgical log
             </h2>
+            <p className="mt-2 text-[11px] leading-4 font-medium tracking-normal text-slate-400 normal-case">
+              Say “log” to start recording, and “exit” to stop.
+            </p>
           </div>
 
            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
@@ -1557,13 +1582,23 @@ export default function SurgicalDashboard() {
               )}
                {speechLog.entries.length > 0 && (
                  <ul className="mt-2 space-y-2">
-                   {speechLog.entries.map((entry, index) => (
+                   {speechLog.entries.map((entry, index) => {
+                     const number = speechLogChronologicalNumber(speechLog.entries.length, index);
+                     const deleteHoverId = `delete-log-${index}`;
+                     const deleteHovered = hovered === deleteHoverId;
+                     return (
                      <li
-                       key={index}
+                       key={`${entry.at}-${index}`}
                        data-speech-entry
-                       className="rounded-lg border border-slate-800/80 bg-slate-900/40 px-3 py-2"
+                       className="flex items-start gap-2 rounded-lg border border-slate-800/80 bg-slate-900/40 px-3 py-2"
                      >
-                       <div className="flex items-baseline justify-between gap-2">
+                       <span
+                         data-speech-entry-number={number}
+                         className="mt-0.5 w-5 shrink-0 text-right font-mono text-xs text-slate-400"
+                       >
+                         {number}
+                       </span>
+                       <div className="flex min-w-0 flex-1 items-baseline justify-between gap-2">
                          <span className="font-mono text-xs text-sky-300 break-all">
                            {entry.text}
                          </span>
@@ -1571,8 +1606,23 @@ export default function SurgicalDashboard() {
                            {formatClock(entry.at)}
                          </time>
                        </div>
+                       <button
+                         type="button"
+                         data-delete-log
+                         data-log-index={index}
+                         aria-label={`Delete log ${number}`}
+                         onClick={() => removeLogEntry(index)}
+                         className={`grid h-7 w-7 shrink-0 place-items-center rounded-md text-base leading-none transition ${
+                           deleteHovered
+                             ? "text-red-500"
+                             : "text-slate-400 hover:text-red-500"
+                         }`}
+                       >
+                         ×
+                       </button>
                      </li>
-                   ))}
+                     );
+                   })}
                  </ul>
                )}
                <button

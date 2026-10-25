@@ -87,6 +87,18 @@ class TestVoiceSpeechLog(unittest.TestCase):
 
         return listen
 
+    def test_wake_word_pause_does_not_clip_the_word(self):
+        self.assertLess(voice.PAUSE_THRESHOLD_S, 0.8)
+        self.assertGreaterEqual(voice.PAUSE_THRESHOLD_S, 0.45)
+        self.assertLessEqual(voice.NON_SPEAKING_DURATION_S, voice.PAUSE_THRESHOLD_S)
+        self.assertGreaterEqual(voice.PHRASE_THRESHOLD_S, 0.3)
+        self.assertFalse(hasattr(voice, "WAKE_PHRASE_LIMIT_S"))
+        recognizer = self.sr.Recognizer()
+        voice.tune_recognizer_for_wake(recognizer)
+        self.assertEqual(recognizer.pause_threshold, voice.PAUSE_THRESHOLD_S)
+        self.assertEqual(recognizer.non_speaking_duration, voice.NON_SPEAKING_DURATION_S)
+        self.assertEqual(recognizer.phrase_threshold, voice.PHRASE_THRESHOLD_S)
+
     def test_voice_speech_log_interface_exists(self):
         self.assertTrue(hasattr(voice, "VoiceSpeechLog"))
         self.assertTrue(hasattr(voice, "LISTEN_TIMEOUT_S"))
@@ -224,6 +236,45 @@ class TestVoiceSpeechLog(unittest.TestCase):
         )
         self.assertEqual(audio_queue.qsize(), 1)
         self.assertEqual(audio_queue.get_nowait().transcript, "add sponge")
+
+    def test_exit_stops_an_empty_recording_without_forwarding_audio(self):
+        recognizer = self.sr.Recognizer()
+
+        def recognize_google(audio, language=None):
+            return audio._transcript
+
+        recognizer.recognize_google = recognize_google
+        log_queue: asyncio.Queue = asyncio.Queue()
+        audio_queue: asyncio.Queue = asyncio.Queue()
+        wl = voice.WakeListener(
+            recognizer,
+            FakeMicrophone(),
+            wake_word="log",
+            language="en-US",
+            phrase_time_limit=5,
+            loop=self.loop,
+            queue=audio_queue,
+            log_queue=log_queue,
+        )
+
+        class FakeLoop:
+            def call_soon_threadsafe(self, fn, arg):
+                fn(arg)
+
+        wl._loop = FakeLoop()
+        wl.arm_from_button()
+        log_queue.get_nowait()
+        recognizer.listen = self._make_listen(["exit"])
+        try:
+            wl._loop_listen()
+        except RuntimeError:
+            pass
+        self.assertEqual(
+            log_queue.get_nowait(),
+            {"type": "speech_log", "phase": "idle", "text": ""},
+        )
+        self.assertTrue(audio_queue.empty())
+        self.assertIsNone(wl._command_deadline)
 
     def test_send_speech_logs(self):
         q: asyncio.Queue = asyncio.Queue()

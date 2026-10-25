@@ -10,6 +10,19 @@ import re
 _TRAILING_PUNCTUATION = " \t,.!?;:-\"'"
 
 
+def split_trailing_exit(text: str) -> tuple[str, bool]:
+    """Drop a trailing whole-word ``exit``. The flag is true when it was spoken."""
+    stripped = (text or "").strip().strip(_TRAILING_PUNCTUATION)
+    if not stripped:
+        return "", False
+    if re.fullmatch(r"exit", stripped, flags=re.IGNORECASE):
+        return "", True
+    match = re.fullmatch(r"(.*\S)\s+exit", stripped, flags=re.IGNORECASE)
+    if match is None:
+        return stripped, False
+    return match.group(1).strip().strip(_TRAILING_PUNCTUATION), True
+
+
 def speech_log_from_transcript(
     transcript: str, wake_word: str = "log", *, armed: bool = False
 ) -> dict[str, str] | None:
@@ -79,34 +92,28 @@ class SpeechLogSession:
         if self.phase == "idle":
             if rem is None:
                 return []
+            addition, stopped = split_trailing_exit(rem)
+            if stopped and not addition:
+                return []
             self.phase = "recording"
-            self.text = rem or ""
-            return [{"type": "speech_log", "phase": "recording", "text": self.text}]
+            self.text = addition
+            events = [{"type": "speech_log", "phase": "recording", "text": self.text}]
+            if stopped:
+                events.extend(self._finish())
+            return events
         if self.phase == "recording":
-            if rem is not None:
-                if rem:
-                    if self.text:
-                        self.text += " " + rem
-                    else:
-                        self.text = rem
-                # bare wake keeps current text
-            else:
-                stripped = transcript.strip().strip(_TRAILING_PUNCTUATION)
-                if stripped:
-                    if self.text:
-                        self.text += " " + stripped
-                    else:
-                        self.text = stripped
+            if rem is not None and rem == "":
+                return [{"type": "speech_log", "phase": "recording", "text": self.text}]
+            source = rem if rem is not None else transcript.strip().strip(_TRAILING_PUNCTUATION)
+            addition, stopped = split_trailing_exit(source)
+            if addition:
+                self.text = f"{self.text} {addition}".strip() if self.text else addition
+            if stopped:
+                return self._finish()
             return [{"type": "speech_log", "phase": "recording", "text": self.text}]
         return []
 
-    def gap(self, seconds: float) -> list[dict[str, str]]:
-        if self.phase != "recording" or seconds <= 0:
-            return []
-        self._gap += seconds
-        threshold = self._arm_hold_s if not self.text else self._silence_s
-        if self._gap < threshold:
-            return []
+    def _finish(self) -> list[dict[str, str]]:
         events: list[dict[str, str]] = []
         if self.text:
             events.append({"type": "speech_log", "phase": "final", "text": self.text})
@@ -117,4 +124,13 @@ class SpeechLogSession:
         self.text = ""
         self._gap = 0.0
         return events
+
+    def gap(self, seconds: float) -> list[dict[str, str]]:
+        if self.phase != "recording" or seconds <= 0:
+            return []
+        self._gap += seconds
+        threshold = self._arm_hold_s if not self.text else self._silence_s
+        if self._gap < threshold:
+            return []
+        return self._finish()
 

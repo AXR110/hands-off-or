@@ -4,6 +4,8 @@ import {
   emptySpeechLog,
   applySpeechLog,
   speechLogStatusLabel,
+  speechLogChronologicalNumber,
+  removeSpeechLogEntry,
   SPEECH_LOG_LIMIT,
 } from "../app/speech-log-state.ts";
 
@@ -92,6 +94,28 @@ test("unknown frame types/phases return same view", () => {
   assert.strictEqual(view.recording, initial.recording);
   assert.strictEqual(view.liveText, initial.liveText);
   assert.deepStrictEqual(view.entries, initial.entries);
+});
+
+test("chronological numbers count the oldest log as 1", () => {
+  assert.strictEqual(speechLogChronologicalNumber(3, 0), 3);
+  assert.strictEqual(speechLogChronologicalNumber(3, 1), 2);
+  assert.strictEqual(speechLogChronologicalNumber(3, 2), 1);
+});
+
+test("removeSpeechLogEntry drops one log and keeps the rest", () => {
+  let view = emptySpeechLog();
+  view = applySpeechLog(view, { type: "speech_log", phase: "final", text: "add sponge", server_ts: 1 });
+  view = applySpeechLog(view, { type: "speech_log", phase: "final", text: "two clamps", server_ts: 2 });
+  view = applySpeechLog(view, { type: "speech_log", phase: "recording", text: "next" });
+  const next = removeSpeechLogEntry(view, 1);
+  assert.strictEqual(next.recording, true);
+  assert.strictEqual(next.liveText, "next");
+  assert.deepStrictEqual(
+    next.entries.map((entry) => entry.text),
+    ["two clamps"],
+  );
+  assert.strictEqual(removeSpeechLogEntry(view, -1), view);
+  assert.strictEqual(removeSpeechLogEntry(view, 2), view);
 });
 
 test("final without server_ts uses now arg", () => {
