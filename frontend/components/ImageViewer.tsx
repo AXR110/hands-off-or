@@ -5,12 +5,14 @@ import { useLayoutEffect, useRef, useState, type RefObject } from "react";
 import {
   appendHandStroke,
   clearImageStrokes,
+  finishHandStroke,
   paintStrokes,
   pointerToCanvas,
   strokesForImage,
   type DrawHand,
   type StrokeMap,
 } from "./draw-strokes";
+import { SNAP_ANIMATION_MS } from "./shapeSnap";
 
 export type HandPointer = { x: number; y: number; pinch: boolean };
 
@@ -87,29 +89,68 @@ export default function ImageViewer({
       drawingRef.current = { primary: false, secondary: false };
     }
 
+    let animationFrame: number | null = null;
     const paintCurrent = () => {
       if (!placeCanvasOverImage(image, canvas)) return;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      paintStrokes(ctx, canvas.width, canvas.height, strokesForImage(drawingsRef.current, imageId));
+      const strokes = strokesForImage(drawingsRef.current, imageId);
+      paintStrokes(ctx, canvas.width, canvas.height, strokes);
+      const animating = strokes.some(
+        (stroke) =>
+          stroke.snapStartedAt != null &&
+          performance.now() - stroke.snapStartedAt < SNAP_ANIMATION_MS,
+      );
+      if (animating && animationFrame == null) {
+        animationFrame = requestAnimationFrame(() => {
+          animationFrame = null;
+          paintCurrent();
+        });
+      }
     };
 
     if (isDrawMode && placeCanvasOverImage(image, canvas)) {
       const rect = canvas.getBoundingClientRect();
       const viewport = { width: window.innerWidth, height: window.innerHeight };
       let drawings = drawingsRef.current;
+      const aspectRatio = canvas.width / canvas.height;
 
       const applyHand = (hand: HandPointer | null, key: DrawHand) => {
         if (!hand?.pinch || pointerOverFilmControl(hand.x, hand.y)) {
+          if (drawingRef.current[key]) {
+            drawings = finishHandStroke(
+              drawings,
+              imageId,
+              key,
+              aspectRatio,
+              performance.now(),
+            );
+          }
           drawingRef.current[key] = false;
           return;
         }
         const point = pointerToCanvas(hand.x, hand.y, rect, viewport);
         if (!point) {
+          if (drawingRef.current[key]) {
+            drawings = finishHandStroke(
+              drawings,
+              imageId,
+              key,
+              aspectRatio,
+              performance.now(),
+            );
+          }
           drawingRef.current[key] = false;
           return;
         }
-        drawings = appendHandStroke(drawings, imageId, key, point, drawingRef.current[key]);
+        drawings = appendHandStroke(
+          drawings,
+          imageId,
+          key,
+          point,
+          drawingRef.current[key],
+          aspectRatio,
+        );
         drawingRef.current[key] = true;
       };
 
@@ -127,6 +168,7 @@ export default function ImageViewer({
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", paintCurrent);
+      if (animationFrame != null) cancelAnimationFrame(animationFrame);
     };
   }, [imageId, imageRef, isDrawMode, paintVersion, pan.x, pan.y, pointer, scale, secondaryPointer]);
 
