@@ -794,17 +794,11 @@ export default function SurgicalDashboard() {
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[#05070d] text-slate-200">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 bg-[#070b14]/95 px-4 py-3 sm:px-6">
         <div className="flex items-center gap-3">
-          <span className="grid h-9 w-9 place-items-center rounded-lg border border-sky-500/40 bg-sky-500/10">
-            <svg viewBox="0 0 24 24" className="h-4 w-4 text-sky-400" aria-hidden>
-              <path
-                d="M12 4v16M4 12h16"
-                stroke="currentColor"
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                fill="none"
-              />
-            </svg>
-          </span>
+          <img
+            src="/logo.jpg"
+            alt=""
+            className="h-12 w-12 shrink-0 object-contain mix-blend-screen"
+          />
           <div>
             <h1 className="text-xs font-semibold tracking-[0.2em] text-slate-100 uppercase sm:text-sm">
               Hands-Off OR
