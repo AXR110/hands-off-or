@@ -436,8 +436,13 @@ export default function SurgicalDashboard() {
         y <= EDGE_WARNING_THRESHOLD ||
         y >= 1 - EDGE_WARNING_THRESHOLD,
     );
-  const frameFade = cursorNearEdge ? "rgba(248, 113, 113, 0.22)" : "rgba(56, 189, 248, 0.18)";
-  const frameEdge = cursorNearEdge ? "rgba(248, 113, 113, 0.32)" : "rgba(125, 211, 252, 0.28)";
+  const frameColor = cursorNearEdge ? "rgba(248, 113, 113, 0.42)" : "rgba(56, 189, 248, 0.3)";
+  const frameMask = [
+    "linear-gradient(to right, #000 0%, transparent 72px)",
+    "linear-gradient(to left, #000 0%, transparent 72px)",
+    "linear-gradient(to bottom, #000 0%, transparent 72px)",
+    "linear-gradient(to top, #000 0%, transparent 72px)",
+  ].join(", ");
 
   const focusStudy = (id: StudyId | null) => {
     if (!id) return;
@@ -921,11 +926,14 @@ export default function SurgicalDashboard() {
       )}
       <div
         aria-hidden
-        className="pointer-events-none fixed inset-0 z-40 transition-[opacity,box-shadow] duration-500 ease-out"
+        className="pointer-events-none fixed inset-0 z-40 transition-opacity duration-500 ease-out"
         style={{
           opacity: handDetected ? 1 : 0,
-          background: `radial-gradient(ellipse at center, transparent 46%, ${frameFade} 100%)`,
-          boxShadow: `inset 0 0 110px 24px ${frameEdge}`,
+          background: frameColor,
+          maskImage: frameMask,
+          WebkitMaskImage: frameMask,
+          maskComposite: "add",
+          WebkitMaskComposite: "source-over",
         }}
       />
     </div>
