@@ -11,8 +11,8 @@ const VOICE_STATUS_TIMEOUT_MS = 3000;
 // Hue eases across this band instead of flipping at a hard edge.
 const EDGE_BLEND_START = 0.14;
 const EDGE_BLEND_END = 0.025;
-const FRAME_BLUE = { h: 198.44, s: 93.2, l: 59.61, a: 0.3 };
-const FRAME_RED = { h: 360, s: 90.6, l: 70.78, a: 0.42 };
+const FRAME_BLUE = { r: 56, g: 189, b: 248, a: 0.3 };
+const FRAME_RED = { r: 248, g: 113, b: 113, a: 0.42 };
 
 const STUDIES = [
   { id: "chest", label: "Chest", detail: "PA chest", src: "/studies/chest.png" },
@@ -107,11 +107,9 @@ function edgeProximity(x: number, y: number) {
 
 function frameTint(amount: number) {
   const t = smoothstep(amount);
-  const h = FRAME_BLUE.h + (FRAME_RED.h - FRAME_BLUE.h) * t;
-  const s = FRAME_BLUE.s + (FRAME_RED.s - FRAME_BLUE.s) * t;
-  const l = FRAME_BLUE.l + (FRAME_RED.l - FRAME_BLUE.l) * t;
-  const a = FRAME_BLUE.a + (FRAME_RED.a - FRAME_BLUE.a) * t;
-  return `hsla(${h.toFixed(2)}, ${s.toFixed(1)}%, ${l.toFixed(1)}%, ${a.toFixed(3)})`;
+  const mix = (from: number, to: number) => Math.round(from + (to - from) * t);
+  const alpha = FRAME_BLUE.a + (FRAME_RED.a - FRAME_BLUE.a) * t;
+  return `rgba(${mix(FRAME_BLUE.r, FRAME_RED.r)}, ${mix(FRAME_BLUE.g, FRAME_RED.g)}, ${mix(FRAME_BLUE.b, FRAME_RED.b)}, ${alpha.toFixed(3)})`;
 }
 
 // Keep the pinched spot fixed. Only stop the film from sliding fully out of view.
@@ -1259,7 +1257,9 @@ export default function SurgicalDashboard() {
         style={{
           opacity: speechLog.recording || handDetected ? 1 : 0,
           background: speechLog.recording ? undefined : frameColor,
-          transition: "opacity 500ms ease-out",
+          transition: speechLog.recording
+            ? "opacity 500ms ease-out"
+            : "opacity 500ms ease-out, background-color 450ms ease-in-out",
           maskImage: frameMask,
           WebkitMaskImage: frameMask,
           maskComposite: "add",
