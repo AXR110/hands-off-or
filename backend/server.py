@@ -39,10 +39,12 @@ import contextlib
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -51,6 +53,7 @@ from typing import Annotated, Any, Iterable, Literal
 
 import gemini_live
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from image_picker import encode_images, pick_image_paths
 from tools import ToolError, dispatch, interpret_log_command
 from pydantic import (
@@ -839,6 +842,269 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+def _load_dotenv_file(path: Path) -> None:
+    """Fill unset environment variables from a local env file. Never overrides or logs values."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].strip()
+        name, value = stripped.split("=", 1)
+        name = name.strip()
+        if not name or name in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[name] = value
+
+
+_load_dotenv_file(Path(__file__).with_name(".env"))
+
+NEARBY_MEDICAL_LIMIT = 5
+NEARBY_MEDICAL_ZOOM = "14z"
+
+
+def _local_ll(lat: float, lng: float) -> str:
+    """SerpApi GPS form: @latitude,longitude,zoom."""
+    return f"@{lat:.6f},{lng:.6f},{NEARBY_MEDICAL_ZOOM}"
+
+
+def _coordinate_uule(lat: float, lng: float) -> str:
+    """Google coordinate UULE. google_local ignores ll and otherwise uses the proxy IP."""
+    payload = (
+        "role:1\n"
+        "producer:12\n"
+        "provenance:0\n"
+        f"timestamp:{int(time.time() * 1_000_000)}\n"
+        "latlng{\n"
+        f"latitude_e7:{int(round(lat * 10_000_000))}\n"
+        f"longitude_e7:{int(round(lng * 10_000_000))}\n"
+        "}\n"
+        "radius:-1\n"
+    )
+    return "a+" + base64.b64encode(payload.encode()).decode()
+
+
+def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    radius_miles = 3958.8
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lng2 - lng1)
+    chord = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * radius_miles * math.asin(math.sqrt(chord))
+
+
+def _format_distance_miles(miles: float) -> str:
+    if miles < 0.1:
+        return f"{round(miles * 5280)} ft"
+    return f"{miles:.1f} mi"
+
+
+def _distance_label(item: dict[str, Any], lat: float, lng: float) -> str:
+    provided = item.get("distance")
+    if isinstance(provided, str) and provided.strip():
+        return provided.strip()
+    coords = item.get("gps_coordinates")
+    if not isinstance(coords, dict):
+        return ""
+    try:
+        place_lat = float(coords["latitude"])
+        place_lng = float(coords["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    return _format_distance_miles(_haversine_miles(lat, lng, place_lat, place_lng))
+
+
+def _google_local_search(params: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from serpapi import GoogleSearch
+    except ImportError as exc:
+        raise RuntimeError("google-search-results is not installed") from exc
+    result = GoogleSearch(params).get_dict()
+    if not isinstance(result, dict):
+        raise RuntimeError("unexpected nearby medical response")
+    return result
+
+
+_FACILITY_TOKEN_STOP = {
+    "medical",
+    "center",
+    "hospital",
+    "clinic",
+    "health",
+    "healthcare",
+    "texas",
+    "austin",
+    "saint",
+    "downtown",
+    "online",
+    "group",
+    "care",
+    "the",
+    "and",
+}
+# More specific services win. A bullet is kept only when the phrase appears in
+# a public listing, so the panel never invents a specialty.
+_SERVICE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("Level I trauma center", r"level\s+i\s+trauma"),
+    ("Level II trauma center", r"level\s+ii\s+trauma"),
+    ("Level III trauma center", r"level\s+iii\s+trauma"),
+    ("Burn center", r"burn\s+(center|unit)"),
+    ("Transplant program", r"\btransplant\b"),
+    ("Stroke care", r"\bstroke\b"),
+    ("Heart and arrhythmia care", r"arrhythmia|cardiology|\bcardiac\b"),
+    ("Telemedicine", r"telemedicine|virtual visit|video visit|virtual consultation"),
+    ("Neonatal intensive care", r"\bnicu\b|neonatal"),
+    ("Labor and delivery", r"labor and delivery|maternity|\bobstetric"),
+    ("Cancer care", r"\bcancer\b|oncolog"),
+    ("Dialysis", r"\bdialysis\b"),
+    ("Pediatric care", r"pediatric"),
+    ("Preventive care", r"preventive care"),
+    ("Intensive care", r"\bicu\b|intensive care"),
+    ("Surgical services", r"surgical services|operating rooms?"),
+    ("Orthopedic care", r"orthop"),
+    ("24/7 emergency care", r"24/7 emergency"),
+    ("Emergency care", r"emergency department|emergency room|emergency care"),
+    ("Urgent care", r"urgent care"),
+    ("Primary care", r"primary care"),
+    ("Behavioral health", r"behavioral health|psychiatr"),
+    ("Rehabilitation", r"\brehab"),
+    ("Women's health", r"women'?s health"),
+)
+_TYPE_SERVICE_NOTES = {
+    "emergency room": "Emergency room",
+    "urgent care center": "Urgent care",
+}
+_NEARBY_CACHE: dict[tuple[float, float], tuple[float, list[dict[str, Any]]]] = {}
+_NEARBY_CACHE_TTL_S = 600
+
+
+def _facility_tokens(name: str) -> list[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z']+", name)
+    tokens = [word.lower() for word in words if word.lower() not in _FACILITY_TOKEN_STOP and len(word) >= 4]
+    return tokens or [name.lower()]
+
+
+def _service_notes_from_text(name: str, place_type: str, hours: str, texts: list[str]) -> list[str]:
+    """Up to two services named in public text for this facility."""
+    blob = "\n".join(texts).lower()
+    notes: list[str] = []
+    for label, pattern in _SERVICE_PATTERNS:
+        if label == "Emergency care" and "24/7 emergency care" in notes:
+            continue
+        if re.search(pattern, blob) and label not in notes:
+            notes.append(label)
+        if len(notes) == 2:
+            return notes
+    type_note = _TYPE_SERVICE_NOTES.get(place_type.strip().lower())
+    emergency_named = any("emergency" in note.lower() for note in notes)
+    if type_note and type_note not in notes and not (type_note == "Emergency room" and emergency_named):
+        notes.append(type_note)
+    if (
+        len(notes) < 2
+        and "24" in hours.lower()
+        and "open" in hours.lower()
+        and "24/7 emergency care" not in notes
+        and "Open 24 hours" not in notes
+    ):
+        notes.append("Open 24 hours")
+    return notes[:2]
+
+
+def _service_page_texts(name: str, api_key: str) -> list[str]:
+    payload = _google_local_search(
+        {
+            "engine": "google",
+            "q": f'"{name}" services',
+            "gl": "us",
+            "hl": "en",
+            "num": 5,
+            "api_key": api_key,
+        }
+    )
+    if payload.get("error"):
+        return []
+    texts: list[str] = []
+    description = (payload.get("knowledge_graph") or {}).get("description")
+    if isinstance(description, str) and description.strip():
+        texts.append(description)
+    tokens = _facility_tokens(name)
+    for item in payload.get("organic_results") or []:
+        if not isinstance(item, dict):
+            continue
+        snippet = item.get("snippet")
+        if not isinstance(snippet, str) or not snippet.strip():
+            continue
+        haystack = f"{item.get('title') or ''} {snippet}".lower()
+        if any(token in haystack for token in tokens):
+            texts.append(snippet)
+    return texts
+
+
+def _attach_service_notes(facilities: list[dict[str, str]], api_key: str) -> list[dict[str, Any]]:
+    def enrich(facility: dict[str, str]) -> dict[str, Any]:
+        try:
+            texts = _service_page_texts(facility["name"], api_key)
+        except Exception:
+            LOG.warning("service note lookup failed for %s", facility["name"])
+            texts = []
+        return {
+            "name": facility["name"],
+            "distance": facility["distance"],
+            "address": facility["address"],
+            "services": _service_notes_from_text(
+                facility["name"],
+                facility.get("place_type") or "",
+                facility.get("hours") or "",
+                texts,
+            ),
+        }
+
+    if not facilities:
+        return []
+    with ThreadPoolExecutor(max_workers=min(NEARBY_MEDICAL_LIMIT, len(facilities))) as pool:
+        return list(pool.map(enrich, facilities))
+
+
+def _top_local_results(payload: dict[str, Any], lat: float, lng: float) -> list[dict[str, str]]:
+    raw = payload.get("local_results")
+    if isinstance(raw, dict):
+        raw = raw.get("places") or []
+    if not isinstance(raw, list):
+        return []
+    facilities: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("title") or item.get("name") or "").strip()
+        if not name:
+            continue
+        facilities.append(
+            {
+                "name": name,
+                "distance": _distance_label(item, lat, lng),
+                "address": str(item.get("address") or "").strip(),
+                "place_type": str(item.get("type") or "").strip(),
+                "hours": str(item.get("hours") or "").strip(),
+            }
+        )
+        if len(facilities) >= NEARBY_MEDICAL_LIMIT:
+            break
+    return facilities
 
 
 @app.websocket("/ws")
@@ -888,6 +1154,46 @@ async def telemetry_socket(
     finally:
         await bridge.remove(client.id)
         LOG.info("client %s disconnected (%d live)", client.id, len(bridge.clients))
+
+
+@app.get("/api/nearby-medical")
+async def nearby_medical(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+) -> dict[str, Any]:
+    """Nearest hospitals and clinics for a GPS fix, via SerpApi Google Local."""
+    api_key = os.getenv("SERPAPI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="SERPAPI_API_KEY is not configured")
+    cache_key = (round(lat, 3), round(lng, 3))
+    cached = _NEARBY_CACHE.get(cache_key)
+    if cached and time.time() - cached[0] < _NEARBY_CACHE_TTL_S:
+        return {"local_results": cached[1]}
+    params = {
+        "engine": "google_local",
+        "q": "hospital clinic",
+        "ll": _local_ll(lat, lng),
+        "uule": _coordinate_uule(lat, lng),
+        "gl": "us",
+        "api_key": api_key,
+    }
+    try:
+        payload = await asyncio.to_thread(_google_local_search, params)
+    except Exception:
+        LOG.exception("nearby medical search failed")
+        raise HTTPException(status_code=502, detail="nearby medical search failed") from None
+    error = payload.get("error")
+    if error:
+        if isinstance(error, str) and api_key not in error:
+            LOG.warning("nearby medical search rejected: %s", error)
+        else:
+            LOG.warning("nearby medical search rejected")
+        raise HTTPException(status_code=502, detail="nearby medical search failed")
+    facilities = await asyncio.to_thread(
+        _attach_service_notes, _top_local_results(payload, lat, lng), api_key
+    )
+    _NEARBY_CACHE[cache_key] = (time.time(), facilities)
+    return {"local_results": facilities}
 
 
 @app.get("/healthz")

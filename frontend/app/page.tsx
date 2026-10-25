@@ -6,6 +6,51 @@ import ImageViewer from "../components/ImageViewer";
 import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
+
+type NearbyFacility = {
+  name: string;
+  distance: string;
+  address: string;
+  services: string[];
+};
+
+type NearbyStatus = "locating" | "loading" | "ready" | "unavailable" | "error";
+
+function bridgeHttpOrigin() {
+  const url = new URL(BRIDGE_URL);
+  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+  return url.origin;
+}
+
+function facilitiesFromNearbyResponse(body: { local_results?: unknown }): NearbyFacility[] {
+  if (!Array.isArray(body.local_results)) return [];
+  return body.local_results.slice(0, 5).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const record = item as {
+      name?: unknown;
+      title?: unknown;
+      distance?: unknown;
+      address?: unknown;
+      services?: unknown;
+    };
+    const name = String(record.name ?? record.title ?? "").trim();
+    if (!name) return [];
+    const services = Array.isArray(record.services)
+      ? record.services
+          .map((service) => String(service).trim())
+          .filter(Boolean)
+          .slice(0, 2)
+      : [];
+    return [
+      {
+        name,
+        distance: String(record.distance ?? "").trim(),
+        address: String(record.address ?? "").trim(),
+        services,
+      },
+    ];
+  });
+}
 const LOG_LIMIT = 50;
 const HAND_DETECTION_TIMEOUT_MS = 500;
 const VOICE_STATUS_TIMEOUT_MS = 3000;
@@ -240,6 +285,11 @@ function pointerOverStage(x: number, y: number, stage: DOMRect | undefined) {
   const px = x * window.innerWidth;
   const py = y * window.innerHeight;
   return px >= stage.left && px <= stage.right && py >= stage.top && py <= stage.bottom;
+}
+
+// Drag the list with the pinch. Moving down reveals what is above.
+function pinchScrollTop(startTop: number, startY: number, y: number, viewportHeight: number) {
+  return startTop - (y - startY) * viewportHeight;
 }
 
 // 1 = finger traveled up, so show the next film. -1 = finger traveled down, so go back.
@@ -587,6 +637,8 @@ export default function SurgicalDashboard() {
   const [uploadedStudies, setUploadedStudies] = useState<Study[]>([]);
   const [fileNotice, setFileNotice] = useState("");
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [nearbyFacilities, setNearbyFacilities] = useState<NearbyFacility[]>([]);
+  const [nearbyStatus, setNearbyStatus] = useState<NearbyStatus>("locating");
   const [scale, setScale] = useState(MIN_ZOOM);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [hovered, setHovered] = useState<StudyId | null>(null);
@@ -607,6 +659,10 @@ export default function SurgicalDashboard() {
   });
   const wakePulseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+  const nearbyScrollRef = useRef<HTMLElement>(null);
+  const nearbyPinchScroll = useRef<{ hand: "primary" | "secondary"; y: number; top: number } | null>(
+    null,
+  );
   const imageRef = useRef<HTMLImageElement>(null);
   const lastPrimaryPinch = useRef<PinchMark | null>(null);
   const lastSecondaryPinch = useRef<PinchMark | null>(null);
@@ -616,6 +672,44 @@ export default function SurgicalDashboard() {
     fired: boolean;
     idleSince: number | null;
   } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!navigator.geolocation) {
+      setNearbyStatus("unavailable");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        if (cancelled) return;
+        const { latitude, longitude } = position.coords;
+        const url = new URL("/api/nearby-medical", bridgeHttpOrigin());
+        url.searchParams.set("lat", String(latitude));
+        url.searchParams.set("lng", String(longitude));
+        setNearbyStatus("loading");
+        fetch(url.toString())
+          .then((response) => {
+            if (!response.ok) throw new Error("nearby medical request failed");
+            return response.json();
+          })
+          .then((body: { local_results?: unknown }) => {
+            if (cancelled) return;
+            setNearbyFacilities(facilitiesFromNearbyResponse(body));
+            setNearbyStatus("ready");
+          })
+          .catch(() => {
+            if (!cancelled) setNearbyStatus("error");
+          });
+      },
+      () => {
+        if (!cancelled) setNearbyStatus("unavailable");
+      },
+      { maximumAge: 60_000, timeout: 12_000 },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const studies: Study[] = [...STUDIES, ...uploadedStudies];
   const studiesRef = useRef<Study[]>([...STUDIES]);
 
@@ -978,6 +1072,52 @@ export default function SurgicalDashboard() {
         typeof x2 === "number" &&
         typeof y2 === "number" &&
         filmControlAtPoint(x2, y2));
+    const nearbyPanel = nearbyScrollRef.current;
+    const pointOverNearby = (x: number, y: number) => {
+      if (!nearbyPanel) return false;
+      const rect = nearbyPanel.getBoundingClientRect();
+      const px = x * window.innerWidth;
+      const py = y * window.innerHeight;
+      return px >= rect.left && px <= rect.right && py >= rect.top && py <= rect.bottom;
+    };
+
+    if (!both && nearbyPanel) {
+      if (primaryDown && pointOverNearby(telemetry.x, telemetry.y)) {
+        nearbyPinchScroll.current = {
+          hand: "primary",
+          y: telemetry.y,
+          top: nearbyPanel.scrollTop,
+        };
+      } else if (
+        secondaryDown &&
+        typeof x2 === "number" &&
+        typeof y2 === "number" &&
+        pointOverNearby(x2, y2) &&
+        nearbyPinchScroll.current == null
+      ) {
+        nearbyPinchScroll.current = { hand: "secondary", y: y2, top: nearbyPanel.scrollTop };
+      }
+    }
+
+    if (nearbyPinchScroll.current && nearbyPanel) {
+      const usingPrimary = nearbyPinchScroll.current.hand === "primary";
+      const handPinch = usingPrimary ? telemetry.pinch_active : secondPinchActive;
+      const handY = usingPrimary ? telemetry.y : y2;
+      if (!handPinch || typeof handY !== "number") {
+        nearbyPinchScroll.current = null;
+      } else {
+        const maxScroll = Math.max(0, nearbyPanel.scrollHeight - nearbyPanel.clientHeight);
+        const next = pinchScrollTop(
+          nearbyPinchScroll.current.top,
+          nearbyPinchScroll.current.y,
+          handY,
+          window.innerHeight,
+        );
+        nearbyPanel.scrollTop = Math.min(maxScroll, Math.max(0, next));
+      }
+    }
+
+    const scrollingNearby = nearbyPinchScroll.current != null;
 
     const clickFilmControl = (x: number, y: number) => {
       const control =
@@ -985,7 +1125,10 @@ export default function SurgicalDashboard() {
       control?.click();
     };
 
-    if (drawing || pinchHitsFilmControl) {
+    if (scrollingNearby) {
+      zoomGesture.current = null;
+      swipeGesture.current = null;
+    } else if (drawing || pinchHitsFilmControl) {
       zoomGesture.current = null;
       swipeGesture.current = null;
       if (!both) {
@@ -1035,7 +1178,7 @@ export default function SurgicalDashboard() {
       zoomGesture.current = null;
     }
 
-    if (!drawing && !pinchHitsFilmControl) {
+    if (!scrollingNearby && !drawing && !pinchHitsFilmControl) {
       if (
         swipeGesture.current?.fired &&
         swipeGesture.current.idleSince != null &&
@@ -1441,6 +1584,68 @@ export default function SurgicalDashboard() {
                </button>
              </div>
           </div>
+
+          <section
+            ref={nearbyScrollRef}
+            data-nearby-medical
+            data-nearby-status={nearbyStatus}
+            aria-label="Nearby Medical Facilities"
+            className="max-h-80 overflow-y-auto border-t border-slate-800/80 px-4 py-3"
+          >
+            <h2 className="text-xs font-semibold tracking-[0.16em] text-slate-100 uppercase">
+              Nearby Medical Facilities
+            </h2>
+            <p className="mt-1 text-[10px] leading-4 text-slate-500">
+              Services named in public listings
+            </p>
+            {nearbyStatus === "ready" && nearbyFacilities.length > 0 ? (
+              <ul className="mt-2 space-y-2">
+                {nearbyFacilities.map((facility) => (
+                  <li
+                    key={`${facility.name}-${facility.address}`}
+                    data-nearby-facility
+                    className="rounded-lg border border-slate-800/80 bg-slate-900/40 px-3 py-2"
+                  >
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className="text-sm font-medium text-slate-100">{facility.name}</span>
+                      {facility.distance && (
+                        <span className="shrink-0 font-mono text-[11px] text-sky-300">
+                          {facility.distance}
+                        </span>
+                      )}
+                    </div>
+                    {facility.address && (
+                      <p className="mt-1 text-[11px] leading-4 text-slate-300">{facility.address}</p>
+                    )}
+                    {facility.services.length > 0 && (
+                      <ul className="mt-2 space-y-1">
+                        {facility.services.map((service) => (
+                          <li
+                            key={service}
+                            data-nearby-service
+                            className="flex gap-2 text-[11px] leading-4 text-slate-200"
+                          >
+                            <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-sky-400" />
+                            <span>{service}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-2 font-mono text-[11px] text-slate-400">
+                {nearbyStatus === "unavailable"
+                  ? "Location access is off"
+                  : nearbyStatus === "error"
+                    ? "Facilities could not be loaded"
+                    : nearbyStatus === "ready"
+                      ? "No facilities nearby"
+                      : "Finding facilities…"}
+              </p>
+            )}
+          </section>
 
           <div className="border-t border-slate-800/80 px-4 py-3">
             <p className="flex items-center gap-2 font-mono text-[10px] tracking-wide text-slate-500">
