@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import ImageViewer from "../components/ImageViewer";
 import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
@@ -182,6 +183,22 @@ function fileAddAtPoint(x: number, y: number) {
 
 function recordAtPoint(x: number, y: number) {
   return buttonAtPoint("[data-start-recording]", x, y) != null;
+}
+
+function drawModeAtPoint(x: number, y: number) {
+  return buttonAtPoint("[data-draw-mode]", x, y) != null;
+}
+
+function clearDrawingAtPoint(x: number, y: number) {
+  return buttonAtPoint("[data-clear-drawing]", x, y) != null;
+}
+
+function filmControlAtPoint(x: number, y: number) {
+  return drawModeAtPoint(x, y) || clearDrawingAtPoint(x, y);
+}
+
+function drawModeEngaged() {
+  return document.querySelector("[data-draw-mode]")?.getAttribute("aria-pressed") === "true";
 }
 
 // A pinch is a click when the pointer is on the control, with a little slack for aim.
@@ -664,6 +681,7 @@ export default function SurgicalDashboard() {
   };
 
   const advanceStudy = (direction: -1 | 1) => {
+    if (drawModeEngaged()) return;
     const current = selectedRef.current;
     const currentStudies = studiesRef.current;
     const index = currentStudies.findIndex((item) => item.id === current);
@@ -793,6 +811,16 @@ export default function SurgicalDashboard() {
   };
 
   const onPinchDown = (x: number, y: number, mark: { current: PinchMark | null }) => {
+    const drawButton = buttonAtPoint("[data-draw-mode]", x, y);
+    if (drawButton) {
+      drawButton.click();
+      return;
+    }
+    const clearButton = buttonAtPoint("[data-clear-drawing]", x, y);
+    if (clearButton) {
+      clearButton.click();
+      return;
+    }
     const now = performance.now();
     const prior = mark.current;
     mark.current = { at: now, x, y };
@@ -822,13 +850,53 @@ export default function SurgicalDashboard() {
     const second =
       typeof x2 === "number" && typeof y2 === "number" && typeof pinch2 === "boolean";
     const both = telemetry.pinch_active && second && pinch2 === true;
+    const stage = stageRef.current?.getBoundingClientRect();
+    const secondPinchActive = second && pinch2 === true;
+    const anyPinch = telemetry.pinch_active || secondPinchActive;
+    const primaryOnly = telemetry.pinch_active && !secondPinchActive;
+    const secondaryOnly = secondPinchActive && !telemetry.pinch_active;
+    const primaryDown = telemetry.pinch_active && !pinchEdge.current.primary;
+    const secondaryDown = secondPinchActive && !pinchEdge.current.secondary;
+    const pinchPoint = primaryOnly
+      ? { x: telemetry.x, y: telemetry.y }
+      : secondaryOnly && typeof x2 === "number" && typeof y2 === "number"
+        ? { x: x2, y: y2 }
+        : null;
+    const drawing = drawModeEngaged();
+    const pinchHitsFilmControl =
+      (primaryDown && filmControlAtPoint(telemetry.x, telemetry.y)) ||
+      (secondaryDown &&
+        typeof x2 === "number" &&
+        typeof y2 === "number" &&
+        filmControlAtPoint(x2, y2));
 
-    if (both && second) {
+    const clickFilmControl = (x: number, y: number) => {
+      const control =
+        buttonAtPoint("[data-draw-mode]", x, y) ?? buttonAtPoint("[data-clear-drawing]", x, y);
+      control?.click();
+    };
+
+    if (drawing || pinchHitsFilmControl) {
+      zoomGesture.current = null;
+      swipeGesture.current = null;
+      if (!both) {
+        if (primaryDown && filmControlAtPoint(telemetry.x, telemetry.y)) {
+          clickFilmControl(telemetry.x, telemetry.y);
+        }
+        if (
+          secondaryDown &&
+          typeof x2 === "number" &&
+          typeof y2 === "number" &&
+          filmControlAtPoint(x2, y2)
+        ) {
+          clickFilmControl(x2, y2);
+        }
+      }
+    } else if (both && second) {
       const distance = Math.hypot(
         (x2 - telemetry.x) * window.innerWidth,
         (y2 - telemetry.y) * window.innerHeight,
       );
-      const stage = stageRef.current?.getBoundingClientRect();
       const layout = imageRef.current ? imageLayout(imageRef.current) : null;
       if (stage && layout && stage.width > 0 && stage.height > 0) {
         const focal = focalInStage(telemetry.x, telemetry.y, x2, y2, stage);
@@ -858,59 +926,48 @@ export default function SurgicalDashboard() {
       zoomGesture.current = null;
     }
 
-    const stage = stageRef.current?.getBoundingClientRect();
-    const secondPinchActive = second && pinch2 === true;
-    const anyPinch = telemetry.pinch_active || secondPinchActive;
-    const primaryOnly = telemetry.pinch_active && !secondPinchActive;
-    const secondaryOnly = secondPinchActive && !telemetry.pinch_active;
-    const primaryDown = telemetry.pinch_active && !pinchEdge.current.primary;
-    const secondaryDown = secondPinchActive && !pinchEdge.current.secondary;
-    const pinchPoint = primaryOnly
-      ? { x: telemetry.x, y: telemetry.y }
-      : secondaryOnly && typeof x2 === "number" && typeof y2 === "number"
-        ? { x: x2, y: y2 }
-        : null;
-
-    if (
-      swipeGesture.current?.fired &&
-      swipeGesture.current.idleSince != null &&
-      performance.now() - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS
-    ) {
-      swipeGesture.current = null;
-    }
-
-    const startedOnFilm =
-      pinchPoint != null &&
-      (primaryDown || secondaryDown) &&
-      swipeGesture.current == null &&
-      pointerOverStage(pinchPoint.x, pinchPoint.y, stage);
-
-    // Thumbnail focus and double-pinch zoom only see a pinch that is not already a film swipe.
-    if (!both && swipeGesture.current == null) {
-      if (primaryDown) onPinchDown(telemetry.x, telemetry.y, lastPrimaryPinch);
-      if (secondaryDown && typeof x2 === "number" && typeof y2 === "number") {
-        onPinchDown(x2, y2, lastSecondaryPinch);
-      }
-    }
-
-    if (both) {
-      if (!swipeGesture.current?.fired) swipeGesture.current = null;
-    } else if (pinchPoint && swipeGesture.current) {
-      swipeGesture.current.idleSince = null;
-      appendSwipe(pinchPoint.x, pinchPoint.y);
-    } else if (startedOnFilm && pinchPoint) {
-      swipeGesture.current = {
-        samples: [{ x: pinchPoint.x, y: pinchPoint.y, at: performance.now() }],
-        fired: false,
-        idleSince: null,
-      };
-    } else if (!anyPinch && swipeGesture.current) {
-      if (!swipeGesture.current.fired) {
+    if (!drawing && !pinchHitsFilmControl) {
+      if (
+        swipeGesture.current?.fired &&
+        swipeGesture.current.idleSince != null &&
+        performance.now() - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS
+      ) {
         swipeGesture.current = null;
-      } else {
-        const now = performance.now();
-        if (swipeGesture.current.idleSince == null) swipeGesture.current.idleSince = now;
-        if (now - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS) swipeGesture.current = null;
+      }
+
+      const startedOnFilm =
+        pinchPoint != null &&
+        (primaryDown || secondaryDown) &&
+        swipeGesture.current == null &&
+        pointerOverStage(pinchPoint.x, pinchPoint.y, stage);
+
+      // Thumbnail focus and double-pinch zoom only see a pinch that is not already a film swipe.
+      if (!both && swipeGesture.current == null) {
+        if (primaryDown) onPinchDown(telemetry.x, telemetry.y, lastPrimaryPinch);
+        if (secondaryDown && typeof x2 === "number" && typeof y2 === "number") {
+          onPinchDown(x2, y2, lastSecondaryPinch);
+        }
+      }
+
+      if (both) {
+        if (!swipeGesture.current?.fired) swipeGesture.current = null;
+      } else if (pinchPoint && swipeGesture.current) {
+        swipeGesture.current.idleSince = null;
+        appendSwipe(pinchPoint.x, pinchPoint.y);
+      } else if (startedOnFilm && pinchPoint) {
+        swipeGesture.current = {
+          samples: [{ x: pinchPoint.x, y: pinchPoint.y, at: performance.now() }],
+          fired: false,
+          idleSince: null,
+        };
+      } else if (!anyPinch && swipeGesture.current) {
+        if (!swipeGesture.current.fired) {
+          swipeGesture.current = null;
+        } else {
+          const now = performance.now();
+          if (swipeGesture.current.idleSince == null) swipeGesture.current.idleSince = now;
+          if (now - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS) swipeGesture.current = null;
+        }
       }
     }
 
@@ -920,7 +977,15 @@ export default function SurgicalDashboard() {
     };
 
     const controlHover = (x: number, y: number) =>
-      fileAddAtPoint(x, y) ? "add-files" : recordAtPoint(x, y) ? "record" : null;
+      fileAddAtPoint(x, y)
+        ? "add-files"
+        : recordAtPoint(x, y)
+          ? "record"
+          : drawModeAtPoint(x, y)
+            ? "draw-mode"
+            : clearDrawingAtPoint(x, y)
+              ? "clear-drawing"
+              : null;
     const nextHover =
       controlHover(telemetry.x, telemetry.y) ??
       studyAtPoint(telemetry.x, telemetry.y) ??
@@ -1125,13 +1190,29 @@ export default function SurgicalDashboard() {
               <span className="pointer-events-none absolute bottom-4 left-4 h-6 w-6 border-b-2 border-l-2 border-sky-500/30" />
               <span className="pointer-events-none absolute right-4 bottom-4 h-6 w-6 border-b-2 border-r-2 border-sky-500/30" />
 
-              <img
-                ref={imageRef}
+              <ImageViewer
+                imageId={study.id}
                 src={study.src}
                 alt={`${study.label} image`}
-                draggable={false}
-                className="max-h-full max-w-full origin-center object-contain select-none"
-                style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}
+                scale={scale}
+                pan={pan}
+                imageRef={imageRef}
+                highlighted={hovered === "draw-mode"}
+                clearHighlighted={hovered === "clear-drawing"}
+                pointer={
+                  telemetry
+                    ? { x: telemetry.x, y: telemetry.y, pinch: telemetry.pinch_active }
+                    : null
+                }
+                secondaryPointer={
+                  secondHand && telemetry
+                    ? {
+                        x: telemetry.x2 ?? 0,
+                        y: telemetry.y2 ?? 0,
+                        pinch: secondPinch,
+                      }
+                    : null
+                }
               />
               {isDraggingFiles && (
                 <div className="pointer-events-none absolute inset-3 z-10 grid place-items-center rounded-xl border-2 border-dashed border-sky-400 bg-sky-950/80 text-center">
