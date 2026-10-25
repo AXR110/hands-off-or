@@ -67,6 +67,13 @@ type PinchMark = {
   y: number;
 };
 
+type PickedImageFile = { name: string; type: string; data_base64: string };
+type PickedImagesFrame = {
+  cancelled?: boolean;
+  error?: string;
+  files?: PickedImageFile[];
+};
+
 type SwipeSample = {
   x: number;
   y: number;
@@ -329,6 +336,7 @@ function useBridge() {
   const [voiceLive, setVoiceLive] = useState(false);
   const seenCalls = useRef(new Set<string>());
   const socketRef = useRef<WebSocket | null>(null);
+  const pickedImagesHandler = useRef<(frame: PickedImagesFrame) => void>(() => {});
 
   useEffect(() => {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -397,6 +405,9 @@ function useBridge() {
         if ((frame as any).type === "speech_log") {
           setSpeechLog((prev) => applySpeechLog(prev, frame as any));
         }
+        if ((frame as { type?: string }).type === "picked_images") {
+          pickedImagesHandler.current(frame as PickedImagesFrame);
+        }
         if ((frame as { type?: string }).type === "voice_status") {
           const active = (frame as { active?: boolean }).active !== false;
           if (voiceStatusTimer) clearTimeout(voiceStatusTimer);
@@ -459,7 +470,26 @@ function useBridge() {
     socketRef.current.send(JSON.stringify({ type: "start_recording" }));
   };
 
-  return { status, telemetry, handDetected, calls, counts, speechLog, voiceLive, startRecording };
+  const requestImagePick = () => {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    socketRef.current.send(JSON.stringify({ type: "pick_images" }));
+    return true;
+  };
+
+  return {
+    status,
+    telemetry,
+    handDetected,
+    calls,
+    counts,
+    speechLog,
+    voiceLive,
+    startRecording,
+    requestImagePick,
+    pickedImagesHandler,
+  };
 }
 
 function formatClock(timestamp: number) {
@@ -507,7 +537,16 @@ function PointerCursor({
 }
 
 export default function SurgicalDashboard() {
-  const { status, telemetry, handDetected, speechLog, voiceLive, startRecording } = useBridge();
+  const {
+    status,
+    telemetry,
+    handDetected,
+    speechLog,
+    voiceLive,
+    startRecording,
+    requestImagePick,
+    pickedImagesHandler,
+  } = useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
   const [uploadedStudies, setUploadedStudies] = useState<Study[]>([]);
   const [fileNotice, setFileNotice] = useState("");
@@ -639,14 +678,22 @@ export default function SurgicalDashboard() {
     focusStudy(next.id);
   };
 
-  const openFilePicker = useCallback((fromPinch = false) => {
-    setFileNotice(
-      fromPinch
-        ? "Pinch reached Add, but your browser may block the file picker. Click Add or press Ctrl/Cmd+O to choose files."
-        : "Choose image files to add them to the image list.",
-    );
+  const imagePickPending = useRef(false);
+
+  const openFilePicker = useCallback(() => {
+    setFileNotice("Choose image files to add them to the image list.");
     fileInputRef.current?.click();
   }, []);
+
+  const openImagesFromPinch = useCallback(() => {
+    if (imagePickPending.current) return;
+    if (!requestImagePick()) {
+      setFileNotice("Pinch reached Add, but the bridge is not connected.");
+      return;
+    }
+    imagePickPending.current = true;
+    setFileNotice("Choose the images to add.");
+  }, [requestImagePick]);
 
   const addFiles = (files: FileList | File[]) => {
     const selectedFiles = Array.from(files);
@@ -678,6 +725,27 @@ export default function SurgicalDashboard() {
           ? `Added ${additions.length} image${additions.length === 1 ? "" : "s"}; skipped ${skippedCount} unsupported file${skippedCount === 1 ? "" : "s"}.`
           : `Added ${additions.length} image${additions.length === 1 ? "" : "s"}. Pinch or click a thumbnail to view it.`,
     );
+  };
+
+  pickedImagesHandler.current = (frame) => {
+    imagePickPending.current = false;
+    if (frame.cancelled) {
+      setFileNotice("No images added.");
+      return;
+    }
+    if (frame.error) {
+      setFileNotice(frame.error);
+      return;
+    }
+    const files = (frame.files ?? []).map((item) => {
+      const binary = atob(item.data_base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return new File([bytes], item.name, { type: item.type || "application/octet-stream" });
+    });
+    addFiles(files);
   };
 
   useEffect(() => {
@@ -736,10 +804,13 @@ export default function SurgicalDashboard() {
     const isDouble =
       prior != null && now - prior.at <= DOUBLE_PINCH_MS && moved <= DOUBLE_PINCH_SLOP_PX;
     if (isDouble && zoomFullyAt(x, y)) return;
-    const pinchedControl =
-      buttonAtPoint("[data-file-add]", x, y) ?? buttonAtPoint("[data-start-recording]", x, y);
-    if (pinchedControl) {
-      pinchedControl.click();
+    if (buttonAtPoint("[data-file-add]", x, y)) {
+      openImagesFromPinch();
+      return;
+    }
+    const recordButton = buttonAtPoint("[data-start-recording]", x, y);
+    if (recordButton) {
+      recordButton.click();
       return;
     }
     focusStudy(studyAtPoint(x, y));

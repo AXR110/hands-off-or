@@ -51,6 +51,7 @@ from typing import Annotated, Any, Iterable, Literal
 
 import gemini_live
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from image_picker import encode_images, pick_image_paths
 from tools import ToolError, dispatch, interpret_log_command
 from pydantic import (
     BaseModel,
@@ -609,6 +610,45 @@ async def handle_voice_status(client: Client, frame: VoiceStatusFrame) -> None:
     )
 
 
+_image_pick_lock = asyncio.Lock()
+
+
+async def handle_pick_images(client: Client) -> None:
+    """Open the system file window for a viewer pinch on Add images."""
+    if client.role != "viewer":
+        await send_protocol_error(
+            client, "forbidden_role", "pick_images is only accepted from a viewer client"
+        )
+        return
+    if _image_pick_lock.locked():
+        await client.send_json(
+            {
+                "type": "picked_images",
+                "files": [],
+                "error": "A file window is already open.",
+            }
+        )
+        return
+    async with _image_pick_lock:
+        try:
+            chosen = await asyncio.to_thread(pick_image_paths)
+        except Exception as exc:
+            LOG.warning("image picker failed: %s", exc)
+            await client.send_json(
+                {
+                    "type": "picked_images",
+                    "files": [],
+                    "error": "Could not open the file window.",
+                }
+            )
+            return
+        if chosen is None:
+            await client.send_json({"type": "picked_images", "files": [], "cancelled": True})
+            return
+        files = await asyncio.to_thread(encode_images, chosen)
+        await client.send_json({"type": "picked_images", "files": files})
+
+
 async def handle_text(client: Client, raw: str) -> None:
     try:
         payload = json.loads(raw)
@@ -641,6 +681,8 @@ async def handle_text(client: Client, raw: str) -> None:
             else:
                 await send_protocol_error(client, "forbidden_role", "start_recording is only accepted from a viewer client")
                 return
+        elif kind == "pick_images":
+            await handle_pick_images(client)
         else:
             await send_protocol_error(client, "unknown_type", f"unsupported frame type {kind!r}")
     except ValidationError as exc:
