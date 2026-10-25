@@ -18,6 +18,7 @@ def _install_stubs():
     sr.UnknownValueError = type("UnknownValueError", (Exception,), {})
     sr.RequestError = type("RequestError", (Exception,), {})
     sr.Recognizer = type("Recognizer", (), {})
+    sr.AudioSource = type("AudioSource", (), {})
     sr.Microphone = type("Microphone", (), {})
     sr.AudioData = type("AudioData", (), {})
     sys.modules["speech_recognition"] = sr
@@ -179,6 +180,50 @@ class TestVoiceSpeechLog(unittest.TestCase):
         self.assertEqual(log_queue.qsize(), 2)
         self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "final", "text": "add sponge and two clamps"})
         self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "idle", "text": ""})
+
+    def test_record_button_arms_the_next_phrase(self):
+        recognizer = self.sr.Recognizer()
+
+        def recognize_google(audio, language=None):
+            return audio._transcript
+
+        recognizer.recognize_google = recognize_google
+        log_queue: asyncio.Queue = asyncio.Queue()
+        audio_queue: asyncio.Queue = asyncio.Queue()
+        wl = voice.WakeListener(
+            recognizer,
+            FakeMicrophone(),
+            wake_word="log",
+            language="en-US",
+            phrase_time_limit=5,
+            loop=self.loop,
+            queue=audio_queue,
+            log_queue=log_queue,
+        )
+
+        class FakeLoop:
+            def call_soon_threadsafe(self, fn, arg):
+                fn(arg)
+
+        wl._loop = FakeLoop()
+        wl.arm_from_button()
+        self.assertEqual(
+            log_queue.get_nowait(),
+            {"type": "speech_log", "phase": "recording", "text": ""},
+        )
+        self.assertIsNotNone(wl._command_deadline)
+
+        recognizer.listen = self._make_listen(["add sponge"])
+        try:
+            wl._loop_listen()
+        except RuntimeError:
+            pass
+        self.assertEqual(
+            log_queue.get_nowait(),
+            {"type": "speech_log", "phase": "recording", "text": "add sponge"},
+        )
+        self.assertEqual(audio_queue.qsize(), 1)
+        self.assertEqual(audio_queue.get_nowait().transcript, "add sponge")
 
     def test_send_speech_logs(self):
         q: asyncio.Queue = asyncio.Queue()

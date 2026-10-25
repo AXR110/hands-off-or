@@ -6,8 +6,9 @@ import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, re
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 const LOG_LIMIT = 50;
-const KNOWN_TOOLS = ["set_pointer", "set_pinch"];
+const KNOWN_TOOLS = ["set_pointer", "set_pinch", "log_instrument", "verify_tray_count"];
 const HAND_DETECTION_TIMEOUT_MS = 500;
+const VOICE_STATUS_TIMEOUT_MS = 3000;
 // Hue eases across this band instead of flipping at a hard edge.
 const EDGE_BLEND_START = 0.14;
 const EDGE_BLEND_END = 0.025;
@@ -275,12 +276,23 @@ type StateSnapshotFrame = {
   telemetry: Telemetry | null;
 };
 
+type FunctionResultFrame = {
+  type: "function_result";
+  call_id: string;
+  name?: string;
+  ok: boolean;
+  result?: Record<string, unknown> | null;
+  server_ts?: number;
+};
+
 type ToolCall = {
   callId: string;
   name: string;
   args: Record<string, unknown>;
   origin: string;
   at: number;
+  result?: Record<string, unknown> | null;
+  ok?: boolean;
 };
 
 function useBridge() {
@@ -290,12 +302,14 @@ function useBridge() {
   const [calls, setCalls] = useState<ToolCall[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [speechLog, setSpeechLog] = useState<SpeechLogView>(emptySpeechLog());
+  const [voiceLive, setVoiceLive] = useState(false);
   const seenCalls = useRef(new Set<string>());
   const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let handDetectionTimer: ReturnType<typeof setTimeout> | null = null;
+    let voiceStatusTimer: ReturnType<typeof setTimeout> | null = null;
     let attempts = 0;
     let disposed = false;
 
@@ -359,12 +373,35 @@ function useBridge() {
         if ((frame as any).type === "speech_log") {
           setSpeechLog((prev) => applySpeechLog(prev, frame as any));
         }
+        if ((frame as { type?: string }).type === "voice_status") {
+          const active = (frame as { active?: boolean }).active !== false;
+          if (voiceStatusTimer) clearTimeout(voiceStatusTimer);
+          voiceStatusTimer = null;
+          if (!active) {
+            setVoiceLive(false);
+          } else {
+            setVoiceLive(true);
+            voiceStatusTimer = setTimeout(() => {
+              setVoiceLive(false);
+              voiceStatusTimer = null;
+            }, VOICE_STATUS_TIMEOUT_MS);
+          }
+        }
         if (frame.type === "telemetry") {
           updateTelemetry(frame);
         } else if (frame.type === "state_snapshot") {
           if (frame.telemetry) updateTelemetry(frame.telemetry);
         } else if (frame.type === "function_call") {
           recordCall(frame);
+        } else if ((frame as { type?: string }).type === "function_result") {
+          const resultFrame = frame as FunctionResultFrame;
+          setCalls((previous) =>
+            previous.map((call) =>
+              call.callId === resultFrame.call_id
+                ? { ...call, result: resultFrame.result ?? null, ok: resultFrame.ok }
+                : call,
+            ),
+          );
         }
       };
 
@@ -385,6 +422,7 @@ function useBridge() {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
       if (handDetectionTimer) clearTimeout(handDetectionTimer);
+      if (voiceStatusTimer) clearTimeout(voiceStatusTimer);
       socketRef.current?.close();
     };
   }, []);
@@ -397,7 +435,7 @@ function useBridge() {
     socketRef.current.send(JSON.stringify({ type: "start_recording" }));
   };
 
-  return { status, telemetry, handDetected, calls, counts, speechLog, startRecording };
+  return { status, telemetry, handDetected, calls, counts, speechLog, voiceLive, startRecording };
 }
 
 function formatClock(timestamp: number) {
@@ -445,7 +483,8 @@ function PointerCursor({
 }
 
 export default function SurgicalDashboard() {
-  const { status, telemetry, handDetected, calls, counts, speechLog, startRecording } = useBridge();
+  const { status, telemetry, handDetected, calls, counts, speechLog, voiceLive, startRecording } =
+    useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
   const [uploadedStudies, setUploadedStudies] = useState<Study[]>([]);
   const [fileNotice, setFileNotice] = useState("");
@@ -1051,11 +1090,22 @@ export default function SurgicalDashboard() {
             >
               <div className="flex items-center gap-2 text-[10px] tracking-[0.18em] uppercase text-slate-400">
                 <span
+                  data-voice-dot={
+                    speechLog.recording ? "log" : voiceLive ? "on" : "off"
+                  }
                   className={`h-1.5 w-1.5 rounded-full ${
-                    speechLog.recording ? "bg-amber-400" : "bg-slate-600"
+                    speechLog.recording
+                      ? "voice-live-dot"
+                      : voiceLive
+                        ? "bg-sky-400"
+                        : "bg-slate-600"
                   }`}
                 />
-                {speechLogStatusLabel(speechLog)}
+                {speechLog.recording
+                  ? speechLogStatusLabel(speechLog)
+                  : voiceLive
+                    ? "Listening for log"
+                    : "Voice off"}
               </div>
               {speechLog.recording && (
                 <p data-speech-live className="mt-1 font-mono text-xs text-sky-300">
@@ -1082,13 +1132,21 @@ export default function SurgicalDashboard() {
                    ))}
                  </ul>
                )}
-               <button type="button" data-start-recording disabled={speechLog.recording} onClick={startRecording} className="mt-2 rounded-md border border-slate-700 px-2 py-1 text-[10px] tracking-[0.16em] text-slate-300 uppercase disabled:opacity-40 cursor-pointer transition active:scale-95 active:border-emerald-400">Record</button>
+               <button
+                 type="button"
+                 data-start-recording
+                 disabled={speechLog.recording}
+                 onClick={startRecording}
+                 className="mt-3 flex min-h-14 w-full items-center justify-center rounded-xl border border-emerald-400/50 bg-emerald-500/15 px-4 py-3 text-base font-semibold tracking-[0.22em] text-emerald-100 uppercase shadow-[0_0_28px_rgba(16,185,129,0.18)] disabled:cursor-default disabled:opacity-40 cursor-pointer transition hover:bg-emerald-500/25 active:scale-[0.98]"
+               >
+                 Record
+               </button>
              </div>
             {calls.length === 0 ? (
               <div className="rounded-lg border border-dashed border-slate-800 px-3 py-6 text-center">
                 <p className="text-xs text-slate-500">No tool calls yet</p>
                 <p className="mt-1 text-[10px] leading-relaxed text-slate-600">
-                  set_pointer and set_pinch calls appear here as the Gemini bridge emits them.
+                  Instrument logs and pointer calls appear here as the bridge emits them.
                 </p>
               </div>
             ) : (
@@ -1107,6 +1165,11 @@ export default function SurgicalDashboard() {
                     <p className="mt-1 break-all font-mono text-[11px] leading-snug text-slate-500">
                       {JSON.stringify(call.args)}
                     </p>
+                    {call.result != null && (
+                      <p className="mt-1 break-all font-mono text-[11px] leading-snug text-slate-300">
+                        {JSON.stringify(call.result)}
+                      </p>
+                    )}
                     <p className="mt-1 text-[9px] tracking-[0.16em] text-slate-600 uppercase">
                       {call.origin} · {call.callId.slice(0, 8)}
                     </p>
@@ -1165,11 +1228,16 @@ export default function SurgicalDashboard() {
       )}
       <div
         aria-hidden
-        className="pointer-events-none fixed inset-0 z-40"
+        data-voice-live={voiceLive ? "on" : "off"}
+        data-log-hue={speechLog.recording ? "on" : "off"}
+        className={`pointer-events-none fixed inset-0 z-40 ${
+          speechLog.recording && edgeAmount <= 0 ? "voice-live-hue" : ""
+        }`}
         style={{
-          opacity: handDetected ? 1 : 0,
-          background: frameColor,
-          transition: "opacity 500ms ease-out, background-color 450ms ease-in-out",
+          opacity: speechLog.recording || handDetected ? 1 : 0,
+          background:
+            speechLog.recording && edgeAmount <= 0 ? undefined : frameColor,
+          transition: "opacity 500ms ease-out",
           maskImage: frameMask,
           WebkitMaskImage: frameMask,
           maskComposite: "add",

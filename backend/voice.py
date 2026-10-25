@@ -18,8 +18,8 @@ bridge relays back are executed with ``tools.dispatch`` and answered with a
 which is what the surgical log renders.
 
 Run with ``python voice.py`` from this directory (the server defaults to
-port 8000). Microphone capture needs PyAudio; on macOS install PortAudio
-first (``brew install portaudio && pip install PyAudio``).
+port 8000). Microphone capture uses sounddevice, which opens the default
+input as 16 kHz mono PCM16 without PyAudio.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ def _ensure_pyaudio() -> None:
 
 _ensure_pyaudio()
 
+import sounddevice as sd
 import speech_recognition as sr
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -76,6 +77,7 @@ COMMAND_WINDOW_S = 6.0
 RECONNECT_DELAY_S = 2.0
 LISTEN_TIMEOUT_S = 1.0
 QUEUE_SIZE = 8
+VOICE_STATUS_INTERVAL_S = 1.0
 
 _TRAILING_PUNCTUATION = " \t,.!?;:-\"'"
 
@@ -135,7 +137,76 @@ def _is_disconnect(exc: BaseException) -> bool:
     return False
 
 
-def _prepare_microphone(recognizer: sr.Recognizer, microphone: sr.Microphone) -> float:
+class _SoundDeviceStream:
+    """Bytes reader matching ``speech_recognition``'s ``stream.read(chunk)``."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def read(self, size: int) -> bytes:
+        data, _overflowed = self._stream.read(size)
+        return bytes(data)
+
+    def close(self) -> None:
+        self._stream.stop()
+        self._stream.close()
+
+
+class SoundDeviceMicrophone(sr.AudioSource):
+    """16 kHz mono PCM16 input through sounddevice.
+
+    ``speech_recognition.Microphone`` needs PyAudio, which is not installed
+    here. sounddevice already opens the MacBook microphone, and
+    ``Recognizer.listen`` only needs ``stream.read``, a sample rate, and a
+    16-bit sample width.
+    """
+
+    def __init__(
+        self,
+        device_index: int | None = None,
+        sample_rate: int = SAMPLE_RATE,
+        chunk_size: int = 1024,
+    ) -> None:
+        if device_index is not None and device_index < 0:
+            raise ValueError("device index must be >= 0")
+        self.device_index = device_index
+        self.SAMPLE_RATE = sample_rate
+        self.SAMPLE_WIDTH = SAMPLE_WIDTH
+        self.CHUNK = chunk_size
+        self.stream: _SoundDeviceStream | None = None
+
+    def __enter__(self) -> SoundDeviceMicrophone:
+        if self.stream is not None:
+            raise RuntimeError("microphone is already open")
+        raw = sd.RawInputStream(
+            samplerate=self.SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=self.CHUNK,
+            device=self.device_index,
+        )
+        raw.start()
+        self.stream = _SoundDeviceStream(raw)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        stream = self.stream
+        self.stream = None
+        if stream is not None:
+            stream.close()
+
+
+def list_input_devices() -> list[tuple[int, str]]:
+    """Input devices as ``(index, name)``, using sounddevice's numbering."""
+    devices = sd.query_devices()
+    found: list[tuple[int, str]] = []
+    for index, device in enumerate(devices):
+        if int(device["max_input_channels"]) > 0:
+            found.append((index, str(device["name"])))
+    return found
+
+
+def _prepare_microphone(recognizer: sr.Recognizer, microphone: sr.AudioSource) -> float:
     with microphone as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
     return recognizer.energy_threshold
@@ -147,7 +218,7 @@ class WakeListener:
     def __init__(
         self,
         recognizer: sr.Recognizer,
-        microphone: sr.Microphone,
+        microphone: sr.AudioSource,
         wake_word: str,
         language: str,
         phrase_time_limit: float,
@@ -167,6 +238,7 @@ class WakeListener:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._command_deadline: float | None = None
+        self.mic_open = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -182,11 +254,15 @@ class WakeListener:
             thread.join(timeout=self._phrase_time_limit + LISTEN_TIMEOUT_S + 1.0)
 
     def arm_from_button(self) -> None:
+        """Same capture window as a bare "log": record the next phrase."""
+        self._arm()
         self._enqueue_logs(self._speech_log.on_manual_start())
+        LOG.info("record button pressed; capturing the next phrase")
 
     def _loop_listen(self) -> None:
         try:
             with self._microphone as source:
+                self.mic_open = True
                 while not self._stop.is_set():
                     try:
                         audio = self._recognizer.listen(
@@ -203,6 +279,8 @@ class WakeListener:
                         LOG.exception("wake listener failed on a phrase")
         except Exception:
             LOG.exception("microphone listener stopped")
+        finally:
+            self.mic_open = False
 
     def _handle(self, audio: sr.AudioData) -> None:
         now = time.monotonic()
@@ -383,6 +461,14 @@ async def send_audio(websocket: Any, queue: asyncio.Queue[CapturedUtterance]) ->
         )
 
 
+async def send_voice_status(websocket: Any, listener: WakeListener) -> None:
+    """Tell viewers the microphone is open. Silence means voice is off."""
+    while True:
+        if listener.mic_open:
+            await websocket.send(json.dumps({"type": "voice_status", "active": True}))
+        await asyncio.sleep(VOICE_STATUS_INTERVAL_S)
+
+
 async def send_speech_logs(websocket: Any, queue: asyncio.Queue[dict[str, str]]) -> None:
     """Send each speech_log event as one JSON text frame."""
     while True:
@@ -395,30 +481,28 @@ async def session(
     queue: asyncio.Queue[CapturedUtterance],
     client_id: str,
     log_queue: asyncio.Queue[dict[str, str]],
+    listener: WakeListener,
     on_start_recording=None,
 ) -> None:
     async with asyncio.TaskGroup() as tasks:
         tasks.create_task(receive_frames(websocket, client_id, on_start_recording), name="voice-receive")
         tasks.create_task(send_audio(websocket, queue), name="voice-send")
         tasks.create_task(send_speech_logs(websocket, log_queue), name="voice-speech-log")
+        tasks.create_task(send_voice_status(websocket, listener), name="voice-status")
 
 
 async def run(args: argparse.Namespace) -> None:
     recognizer = sr.Recognizer()
     recognizer.dynamic_energy_threshold = True
     try:
-        microphone = sr.Microphone(device_index=args.device)
-    except (AttributeError, OSError, ImportError) as exc:
-        raise SystemExit(
-            "Could not open a microphone. Install PyAudio "
-            "(on macOS: brew install portaudio && pip install PyAudio). "
-            f"{exc}"
-        ) from exc
+        microphone = SoundDeviceMicrophone(device_index=args.device)
+    except (OSError, ValueError, sd.PortAudioError) as exc:
+        raise SystemExit(f"Could not open a microphone. {exc}") from exc
 
     LOG.info("calibrating microphone for ambient noise")
     try:
         threshold = await asyncio.to_thread(_prepare_microphone, recognizer, microphone)
-    except (AttributeError, OSError, ImportError) as exc:
+    except (OSError, ValueError, sd.PortAudioError) as exc:
         raise SystemExit(f"Could not open the microphone: {exc}") from exc
     LOG.info(
         "listening for wake word %r (energy threshold %.0f)",
@@ -447,7 +531,14 @@ async def run(args: argparse.Namespace) -> None:
                 async with connect(args.server, max_size=None, ping_interval=20) as websocket:
                     LOG.info("connected to %s", args.server)
                     try:
-                        await session(websocket, queue, client_id, log_queue, listener.arm_from_button)
+                        await session(
+                            websocket,
+                            queue,
+                            client_id,
+                            log_queue,
+                            listener,
+                            listener.arm_from_button,
+                        )
                     except BaseExceptionGroup as exc:
                         if not _is_disconnect(exc):
                             raise
@@ -465,17 +556,13 @@ async def run(args: argparse.Namespace) -> None:
 
 def _list_devices() -> None:
     try:
-        names = sr.Microphone.list_microphone_names()
-    except (AttributeError, OSError, ImportError) as exc:
-        raise SystemExit(
-            "Could not list microphones. Install PyAudio "
-            "(on macOS: brew install portaudio && pip install PyAudio). "
-            f"{exc}"
-        ) from exc
-    if not names:
+        devices = list_input_devices()
+    except (OSError, sd.PortAudioError) as exc:
+        raise SystemExit(f"Could not list microphones. {exc}") from exc
+    if not devices:
         print("no microphones found")
         return
-    for index, name in enumerate(names):
+    for index, name in devices:
         print(f"{index}\t{name}")
 
 

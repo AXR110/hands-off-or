@@ -62,3 +62,47 @@ body {
       inset 0 0 64px rgba(34, 197, 94, 0.28);
   }
 }
+
+/* Log capture only: green edge while "log" or Record has armed a phrase. */
+.voice-live-hue {
+  animation: voice-hue-pulse 3.2s ease-in-out infinite;
+}
+
+@keyframes voice-hue-pulse {
+  0%,
+  100% {
+    background: hsla(198.44, 93.2%, 59.61%, 0.3);
+  }
+  50% {
+    background: hsla(142, 72%, 52%, 0.55);
+  }
+}
+
+.voice-live-dot {
+  background-color: #4ade80;
+  animation: voice-dot-pulse 3.2s ease-in-out infinite;
+}
+
+@keyframes voice-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    box-shadow: 0 0 0 rgba(74, 222, 128, 0);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 10px #4ade80;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-live-hue {
+    animation: none;
+    background: hsla(142, 72%, 52%, 0.45);
+  }
+
+  .voice-live-dot {
+    animation: none;
+    opacity: 1;
+  }
+}
