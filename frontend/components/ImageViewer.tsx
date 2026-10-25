@@ -1,6 +1,7 @@
 "use client";
 
 import { useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { createPortal } from "react-dom";
 
 import {
   appendHandStroke,
@@ -23,6 +24,7 @@ type ImageViewerProps = {
   scale: number;
   pan: { x: number; y: number };
   imageRef: RefObject<HTMLImageElement | null>;
+  toolbarTarget: HTMLElement | null;
   pointer: HandPointer | null;
   secondaryPointer: HandPointer | null;
   highlighted: boolean;
@@ -61,6 +63,7 @@ export default function ImageViewer({
   scale,
   pan,
   imageRef,
+  toolbarTarget,
   pointer,
   secondaryPointer,
   highlighted,
@@ -174,35 +177,39 @@ export default function ImageViewer({
 
   return (
     <>
-      <div className="absolute top-3 left-1/2 z-20 flex -translate-x-1/2 gap-2">
-        <button
-          type="button"
-          data-draw-mode
-          aria-pressed={isDrawMode}
-          onClick={() => setIsDrawMode((current) => !current)}
-          className={`min-h-14 rounded-lg border px-5 py-3 text-sm font-semibold tracking-[0.18em] uppercase transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-400 ${
-            isDrawMode
-              ? "border-red-700 bg-red-600 text-white shadow-[0_0_28px_rgba(220,38,38,0.75)]"
-              : highlighted
-                ? "border-sky-200 bg-sky-400 text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.6)]"
-                : "border-slate-600 bg-slate-950/80 text-slate-200 hover:border-slate-400"
-          }`}
-        >
-          Draw mode
-        </button>
-        <button
-          type="button"
-          data-clear-drawing
-          onClick={clearDrawing}
-          className={`min-h-14 rounded-lg border px-5 py-3 text-sm font-semibold tracking-[0.18em] uppercase transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-300 ${
-            clearHighlighted
-              ? "border-sky-200 bg-sky-400 text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.6)]"
-              : "border-slate-600 bg-slate-950/80 text-slate-200 hover:border-slate-400"
-          }`}
-        >
-          Clear drawing
-        </button>
-      </div>
+      {toolbarTarget &&
+        createPortal(
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              data-draw-mode
+              aria-pressed={isDrawMode}
+              onClick={() => setIsDrawMode((current) => !current)}
+              className={`min-h-10 rounded-lg border px-3 py-2 text-[10px] font-semibold tracking-[0.1em] uppercase transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-400 ${
+                isDrawMode
+                  ? "border-red-700 bg-red-600 text-white shadow-[0_0_28px_rgba(220,38,38,0.75)]"
+                  : highlighted
+                    ? "border-sky-200 bg-sky-400 text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.6)]"
+                    : "border-slate-600 bg-slate-950/80 text-slate-200 hover:border-slate-400"
+              }`}
+            >
+              Draw mode
+            </button>
+            <button
+              type="button"
+              data-clear-drawing
+              onClick={clearDrawing}
+              className={`min-h-10 rounded-lg border px-3 py-2 text-[10px] font-semibold tracking-[0.1em] uppercase transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-300 ${
+                clearHighlighted
+                  ? "border-sky-200 bg-sky-400 text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.6)]"
+                  : "border-slate-600 bg-slate-950/80 text-slate-200 hover:border-slate-400"
+              }`}
+            >
+              Clear drawing
+            </button>
+          </div>,
+          toolbarTarget,
+        )}
       <img
         ref={imageRef}
         src={src}

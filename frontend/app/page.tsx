@@ -642,6 +642,7 @@ export default function SurgicalDashboard() {
   const [scale, setScale] = useState(MIN_ZOOM);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [hovered, setHovered] = useState<StudyId | null>(null);
+  const [drawToolbarTarget, setDrawToolbarTarget] = useState<HTMLDivElement | null>(null);
   const [awake, setAwake] = useState(false);
   const [wakeProgress, setWakeProgress] = useState(0);
   const [wakePulse, setWakePulse] = useState(false);
@@ -1422,12 +1423,16 @@ export default function SurgicalDashboard() {
           </nav>
 
           <section className="flex h-full min-h-[320px] min-w-0 flex-1 flex-col overflow-hidden bg-[#060a12] md:m-3 md:rounded-xl md:border md:border-slate-800/80 md:shadow-[inset_0_0_120px_rgba(14,165,233,0.06)]">
-            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-slate-800/70 px-4 py-2.5">
-              <div className="flex items-center gap-2 text-[10px] tracking-[0.22em] text-slate-500 uppercase">
+            <div className="grid grid-cols-1 items-center gap-y-2 border-b border-slate-800/70 px-4 py-2.5 md:grid-cols-[1fr_auto_1fr]">
+              <div className="flex items-center gap-2 text-[10px] tracking-[0.22em] text-slate-500 uppercase md:col-start-1 md:row-start-1">
                 <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
                 {study.label} image
               </div>
-              <span className="text-right">
+              <div
+                ref={setDrawToolbarTarget}
+                className="flex min-w-0 justify-center md:col-start-2 md:row-start-1"
+              />
+              <span className="text-center md:col-start-3 md:row-start-1 md:text-right">
                 <span className="block font-mono text-[10px] tracking-wider text-slate-400">
                   {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
                 </span>
@@ -1472,6 +1477,7 @@ export default function SurgicalDashboard() {
                 scale={scale}
                 pan={pan}
                 imageRef={imageRef}
+                toolbarTarget={drawToolbarTarget}
                 highlighted={hovered === "draw-mode"}
                 clearHighlighted={hovered === "clear-drawing"}
                 pointer={
