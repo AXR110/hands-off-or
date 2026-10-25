@@ -7,6 +7,12 @@ import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, re
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 const LOG_LIMIT = 50;
 const KNOWN_TOOLS = ["set_pointer", "set_pinch"];
+const HAND_DETECTION_TIMEOUT_MS = 500;
+// Hue eases across this band instead of flipping at a hard edge.
+const EDGE_BLEND_START = 0.14;
+const EDGE_BLEND_END = 0.025;
+const FRAME_BLUE = { h: 198.44, s: 93.2, l: 59.61, a: 0.3 };
+const FRAME_RED = { h: 360, s: 90.6, l: 70.78, a: 0.42 };
 
 const STUDIES = [
   { id: "chest", label: "Chest", detail: "PA chest", src: "/studies/chest.png" },
@@ -19,6 +25,16 @@ type StudyId = (typeof STUDIES)[number]["id"];
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
 const ZOOM_START_PX = 48;
+const DOUBLE_PINCH_MS = 650;
+const DOUBLE_PINCH_SLOP_PX = 140;
+// A flick while one pinch is held. Slow drifts and sideways motion stay put.
+const SWIPE_WINDOW_MS = 320;
+const SWIPE_MIN_MS = 80;
+const SWIPE_MIN_SAMPLES = 3;
+const SWIPE_MIN_SPEED = 0.45;
+const SWIPE_AXIS_RATIO = 1.5;
+// One film per flick. Pinch tracking can drop for a frame mid-swipe; wait until it stays open.
+const SWIPE_RELEASE_MS = 320;
 
 type Point = { x: number; y: number };
 
@@ -27,6 +43,18 @@ type ZoomGesture = {
   scale: number;
   anchorX: number;
   anchorY: number;
+};
+
+type PinchMark = {
+  at: number;
+  x: number;
+  y: number;
+};
+
+type SwipeSample = {
+  x: number;
+  y: number;
+  at: number;
 };
 
 type ImageLayout = {
@@ -42,6 +70,25 @@ function clamp(value: number, min: number, max: number) {
 
 function clampZoom(scale: number) {
   return clamp(scale, MIN_ZOOM, MAX_ZOOM);
+}
+
+function smoothstep(value: number) {
+  const t = clamp(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function edgeProximity(x: number, y: number) {
+  const distance = Math.min(x, 1 - x, y, 1 - y);
+  return (EDGE_BLEND_START - distance) / (EDGE_BLEND_START - EDGE_BLEND_END);
+}
+
+function frameTint(amount: number) {
+  const t = smoothstep(amount);
+  const h = FRAME_BLUE.h + (FRAME_RED.h - FRAME_BLUE.h) * t;
+  const s = FRAME_BLUE.s + (FRAME_RED.s - FRAME_BLUE.s) * t;
+  const l = FRAME_BLUE.l + (FRAME_RED.l - FRAME_BLUE.l) * t;
+  const a = FRAME_BLUE.a + (FRAME_RED.a - FRAME_BLUE.a) * t;
+  return `hsla(${h.toFixed(2)}, ${s.toFixed(1)}%, ${l.toFixed(1)}%, ${a.toFixed(3)})`;
 }
 
 // Keep the pinched spot fixed. Only stop the film from sliding fully out of view.
@@ -109,6 +156,64 @@ function studyAtPoint(x: number, y: number): StudyId | null {
   return null;
 }
 
+function pointerOverStage(x: number, y: number, stage: DOMRect | undefined) {
+  if (!stage || stage.width <= 0 || stage.height <= 0) return false;
+  const px = x * window.innerWidth;
+  const py = y * window.innerHeight;
+  return px >= stage.left && px <= stage.right && py >= stage.top && py <= stage.bottom;
+}
+
+// 1 = finger traveled up, so show the next film. -1 = finger traveled down, so go back.
+function classifyVerticalSwipe(
+  samples: SwipeSample[],
+  viewportWidth: number,
+  viewportHeight: number,
+): -1 | 1 | null {
+  if (samples.length < SWIPE_MIN_SAMPLES || viewportWidth < 1 || viewportHeight < 1) return null;
+  const minTravel = Math.max(72, viewportHeight * 0.08);
+  let bestSpeed = 0;
+  let best: -1 | 1 | null = null;
+
+  for (let start = 0; start < samples.length - 1; start += 1) {
+    const from = samples[start];
+    const to = samples[samples.length - 1];
+    const elapsed = to.at - from.at;
+    if (elapsed < SWIPE_MIN_MS || elapsed > SWIPE_WINDOW_MS) continue;
+    const dx = (to.x - from.x) * viewportWidth;
+    const dy = (to.y - from.y) * viewportHeight;
+    const absX = Math.abs(dx);
+    const absY = Math.abs(dy);
+    if (absY < minTravel || absY < absX * SWIPE_AXIS_RATIO) continue;
+    const speed = absY / elapsed;
+    if (speed < SWIPE_MIN_SPEED || speed <= bestSpeed) continue;
+    if (!swipePathAgrees(samples, start)) continue;
+    bestSpeed = speed;
+    best = dy < 0 ? 1 : -1;
+  }
+  return best;
+}
+
+function swipePathAgrees(samples: SwipeSample[], start: number) {
+  const sign = Math.sign(samples[samples.length - 1].y - samples[start].y);
+  if (sign === 0) return false;
+  let agreeing = 0;
+  let steps = 0;
+  let largest = 0;
+  let total = 0;
+  for (let index = start + 1; index < samples.length; index += 1) {
+    const step = samples[index].y - samples[index - 1].y;
+    if (Math.abs(step) < 0.003) continue;
+    steps += 1;
+    const magnitude = Math.abs(step);
+    total += magnitude;
+    if (magnitude > largest) largest = magnitude;
+    if (Math.sign(step) === sign) agreeing += 1;
+  }
+  // One jumped sample is tracking noise. A flick keeps moving for several frames.
+  if (steps < 2 || agreeing / steps < 0.7 || total <= 0) return false;
+  return largest / total <= 0.8;
+}
+
 type ConnectionStatus = "connecting" | "online" | "reconnecting";
 
 // Mirrors $defs/telemetryEvent and $defs/stateSnapshot in backend/shared_schema.json.
@@ -153,6 +258,7 @@ type ToolCall = {
 function useBridge() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
+  const [handDetected, setHandDetected] = useState(false);
   const [calls, setCalls] = useState<ToolCall[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [speechLog, setSpeechLog] = useState<SpeechLogView>(emptySpeechLog());
@@ -161,12 +267,27 @@ function useBridge() {
 
   useEffect(() => {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let handDetectionTimer: ReturnType<typeof setTimeout> | null = null;
     let attempts = 0;
     let disposed = false;
 
     const url = new URL(BRIDGE_URL);
     url.searchParams.set("role", "viewer");
     url.searchParams.set("client_id", `web-${Math.random().toString(36).slice(2, 8)}`);
+
+    const updateTelemetry = (frame: Telemetry) => {
+      setTelemetry(frame);
+      if (handDetectionTimer) clearTimeout(handDetectionTimer);
+      const age = Math.max(0, Date.now() - frame.server_ts);
+      const freshFor = Math.max(0, HAND_DETECTION_TIMEOUT_MS - age);
+      setHandDetected(freshFor > 0);
+      if (freshFor > 0) {
+        handDetectionTimer = setTimeout(() => {
+          setHandDetected(false);
+          handDetectionTimer = null;
+        }, freshFor);
+      }
+    };
 
     const recordCall = (frame: FunctionCallFrame) => {
       if (seenCalls.current.has(frame.call_id)) return;
@@ -207,13 +328,13 @@ function useBridge() {
         } catch {
           return;
         }
-        if (frame.type === "speech_log") {
-          setSpeechLog((prev) => applySpeechLog(prev, frame));
+        if ((frame as any).type === "speech_log") {
+          setSpeechLog((prev) => applySpeechLog(prev, frame as any));
         }
         if (frame.type === "telemetry") {
-          setTelemetry(frame);
+          updateTelemetry(frame);
         } else if (frame.type === "state_snapshot") {
-          if (frame.telemetry) setTelemetry(frame.telemetry);
+          if (frame.telemetry) updateTelemetry(frame.telemetry);
         } else if (frame.type === "function_call") {
           recordCall(frame);
         }
@@ -235,6 +356,7 @@ function useBridge() {
     return () => {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      if (handDetectionTimer) clearTimeout(handDetectionTimer);
       socketRef.current?.close();
     };
   }, []);
@@ -247,7 +369,7 @@ function useBridge() {
     socketRef.current.send(JSON.stringify({ type: "start_recording" }));
   };
 
-  return { status, telemetry, calls, counts, speechLog, startRecording };
+  return { status, telemetry, handDetected, calls, counts, speechLog, startRecording };
 }
 
 function formatClock(timestamp: number) {
@@ -295,7 +417,7 @@ function PointerCursor({
 }
 
 export default function SurgicalDashboard() {
-  const { status, telemetry, calls, counts, speechLog, startRecording } = useBridge();
+  const { status, telemetry, handDetected, calls, counts, speechLog, startRecording } = useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
   const [scale, setScale] = useState(MIN_ZOOM);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
@@ -306,6 +428,15 @@ export default function SurgicalDashboard() {
   const pinchEdge = useRef({ primary: false, secondary: false });
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
+  const lastPrimaryPinch = useRef<PinchMark | null>(null);
+  const lastSecondaryPinch = useRef<PinchMark | null>(null);
+  const selectedRef = useRef(selected);
+  const swipeGesture = useRef<{
+    samples: SwipeSample[];
+    fired: boolean;
+    idleSince: number | null;
+  } | null>(null);
+  selectedRef.current = selected;
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -325,6 +456,25 @@ export default function SurgicalDashboard() {
   const secondPinch = Boolean(secondHand && telemetry?.pinch2_active);
   const study = STUDIES.find((item) => item.id === selected) ?? STUDIES[0];
   const zoomPercent = Math.round(scale * 100);
+  const pointerPositions: Point[] = telemetry
+    ? [
+        { x: telemetry.x, y: telemetry.y },
+        ...(typeof telemetry.x2 === "number" && typeof telemetry.y2 === "number"
+          ? [{ x: telemetry.x2, y: telemetry.y2 }]
+          : []),
+      ]
+    : [];
+  const edgeAmount = pointerPositions.reduce(
+    (nearest, point) => Math.max(nearest, edgeProximity(point.x, point.y)),
+    0,
+  );
+  const frameColor = frameTint(edgeAmount);
+  const frameMask = [
+    "linear-gradient(to right, #000 0%, transparent 72px)",
+    "linear-gradient(to left, #000 0%, transparent 72px)",
+    "linear-gradient(to bottom, #000 0%, transparent 72px)",
+    "linear-gradient(to top, #000 0%, transparent 72px)",
+  ].join(", ");
 
   const focusStudy = (id: StudyId | null) => {
     if (!id) return;
@@ -334,6 +484,103 @@ export default function SurgicalDashboard() {
     panRef.current = { x: 0, y: 0 };
     setScale(MIN_ZOOM);
     setPan({ x: 0, y: 0 });
+  };
+
+  const showView = (next: { scale: number; x: number; y: number }) => {
+    const nextPan = { x: next.x, y: next.y };
+    scaleRef.current = next.scale;
+    panRef.current = nextPan;
+    setScale(next.scale);
+    setPan(nextPan);
+  };
+
+  const zoomFullyAt = (x: number, y: number) => {
+    const stage = stageRef.current?.getBoundingClientRect();
+    const layout = imageRef.current ? imageLayout(imageRef.current) : null;
+    if (!stage || !layout || stage.width <= 0 || stage.height <= 0) return false;
+    const px = x * window.innerWidth;
+    const py = y * window.innerHeight;
+    const overStage =
+      px >= stage.left && px <= stage.right && py >= stage.top && py <= stage.bottom;
+    if (!overStage) return false;
+    zoomGesture.current = null;
+    if (scaleRef.current >= MAX_ZOOM - 0.05) {
+      showView({ scale: MIN_ZOOM, x: 0, y: 0 });
+      return true;
+    }
+    const safeScale = scaleRef.current || MIN_ZOOM;
+    const focal = {
+      x: clamp(px, stage.left, stage.right),
+      y: clamp(py, stage.top, stage.bottom),
+    };
+    showView(
+      zoomAtFocal(
+        {
+          baseline: 1,
+          scale: MAX_ZOOM,
+          anchorX: clamp(
+            (focal.x - layout.centerX - panRef.current.x) / safeScale,
+            -layout.width / 2,
+            layout.width / 2,
+          ),
+          anchorY: clamp(
+            (focal.y - layout.centerY - panRef.current.y) / safeScale,
+            -layout.height / 2,
+            layout.height / 2,
+          ),
+        },
+        focal,
+        1,
+        layout,
+        stage,
+      ),
+    );
+    return true;
+  };
+
+  const advanceStudy = (direction: -1 | 1) => {
+    const current = selectedRef.current;
+    const index = STUDIES.findIndex((item) => item.id === current);
+    if (index < 0) return;
+    const next = STUDIES[(index + direction + STUDIES.length) % STUDIES.length];
+    if (!next || next.id === current) return;
+    selectedRef.current = next.id;
+    lastPrimaryPinch.current = null;
+    lastSecondaryPinch.current = null;
+    focusStudy(next.id);
+  };
+
+  const appendSwipe = (x: number, y: number) => {
+    const gesture = swipeGesture.current;
+    if (!gesture || gesture.fired) return;
+    const now = performance.now();
+    gesture.samples.push({ x, y, at: now });
+    const cutoff = now - SWIPE_WINDOW_MS;
+    while (gesture.samples.length > SWIPE_MIN_SAMPLES && gesture.samples[0].at < cutoff) {
+      gesture.samples.shift();
+    }
+    const direction = classifyVerticalSwipe(
+      gesture.samples,
+      window.innerWidth,
+      window.innerHeight,
+    );
+    if (direction == null) return;
+    gesture.fired = true;
+    gesture.samples = [];
+    advanceStudy(direction);
+  };
+
+  const onPinchDown = (x: number, y: number, mark: { current: PinchMark | null }) => {
+    const now = performance.now();
+    const prior = mark.current;
+    mark.current = { at: now, x, y };
+    const moved = prior
+      ? Math.hypot((x - prior.x) * window.innerWidth, (y - prior.y) * window.innerHeight)
+      : Number.POSITIVE_INFINITY;
+    const isDouble =
+      prior != null && now - prior.at <= DOUBLE_PINCH_MS && moved <= DOUBLE_PINCH_SLOP_PX;
+    if (isDouble && zoomFullyAt(x, y)) return;
+    focusStudy(studyAtPoint(x, y));
   };
 
   useEffect(() => {
@@ -373,21 +620,66 @@ export default function SurgicalDashboard() {
             };
           }
         } else {
-          const next = zoomAtFocal(zoomGesture.current, focal, distance, layout, stage);
-          const nextPan = { x: next.x, y: next.y };
-          scaleRef.current = next.scale;
-          panRef.current = nextPan;
-          setScale(next.scale);
-          setPan(nextPan);
+          showView(zoomAtFocal(zoomGesture.current, focal, distance, layout, stage));
         }
       }
     } else {
       zoomGesture.current = null;
-      if (telemetry.pinch_active && !pinchEdge.current.primary) {
-        focusStudy(studyAtPoint(telemetry.x, telemetry.y));
+    }
+
+    const stage = stageRef.current?.getBoundingClientRect();
+    const secondPinchActive = second && pinch2 === true;
+    const anyPinch = telemetry.pinch_active || secondPinchActive;
+    const primaryOnly = telemetry.pinch_active && !secondPinchActive;
+    const secondaryOnly = secondPinchActive && !telemetry.pinch_active;
+    const primaryDown = telemetry.pinch_active && !pinchEdge.current.primary;
+    const secondaryDown = secondPinchActive && !pinchEdge.current.secondary;
+    const pinchPoint = primaryOnly
+      ? { x: telemetry.x, y: telemetry.y }
+      : secondaryOnly && typeof x2 === "number" && typeof y2 === "number"
+        ? { x: x2, y: y2 }
+        : null;
+
+    if (
+      swipeGesture.current?.fired &&
+      swipeGesture.current.idleSince != null &&
+      performance.now() - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS
+    ) {
+      swipeGesture.current = null;
+    }
+
+    const startedOnFilm =
+      pinchPoint != null &&
+      (primaryDown || secondaryDown) &&
+      swipeGesture.current == null &&
+      pointerOverStage(pinchPoint.x, pinchPoint.y, stage);
+
+    // Thumbnail focus and double-pinch zoom only see a pinch that is not already a film swipe.
+    if (!both && swipeGesture.current == null) {
+      if (primaryDown) onPinchDown(telemetry.x, telemetry.y, lastPrimaryPinch);
+      if (secondaryDown && typeof x2 === "number" && typeof y2 === "number") {
+        onPinchDown(x2, y2, lastSecondaryPinch);
       }
-      if (second && pinch2 && !pinchEdge.current.secondary) {
-        focusStudy(studyAtPoint(x2, y2));
+    }
+
+    if (both) {
+      if (!swipeGesture.current?.fired) swipeGesture.current = null;
+    } else if (pinchPoint && swipeGesture.current) {
+      swipeGesture.current.idleSince = null;
+      appendSwipe(pinchPoint.x, pinchPoint.y);
+    } else if (startedOnFilm && pinchPoint) {
+      swipeGesture.current = {
+        samples: [{ x: pinchPoint.x, y: pinchPoint.y, at: performance.now() }],
+        fired: false,
+        idleSince: null,
+      };
+    } else if (!anyPinch && swipeGesture.current) {
+      if (!swipeGesture.current.fired) {
+        swipeGesture.current = null;
+      } else {
+        const now = performance.now();
+        if (swipeGesture.current.idleSince == null) swipeGesture.current.idleSince = now;
+        if (now - swipeGesture.current.idleSince >= SWIPE_RELEASE_MS) swipeGesture.current = null;
       }
     }
 
@@ -547,7 +839,7 @@ export default function SurgicalDashboard() {
                   {zoomPercent}% · {Math.round(MIN_ZOOM * 100)}–{Math.round(MAX_ZOOM * 100)}
                 </span>
                 <span className="mt-0.5 block text-[9px] tracking-[0.14em] text-slate-600 uppercase">
-                  Follows both hands
+                  Pinch twice to zoom · pinch and swipe up or down to change
                 </span>
               </span>
             </div>
@@ -696,10 +988,10 @@ export default function SurgicalDashboard() {
         </aside>
       </div>
 
-      {telemetry && (
+      {handDetected && telemetry && (
         <PointerCursor x={telemetry.x} y={telemetry.y} pinched={telemetry.pinch_active} />
       )}
-      {secondHand && telemetry && (
+      {handDetected && secondHand && telemetry && (
         <PointerCursor
           x={telemetry.x2 ?? 0}
           y={telemetry.y2 ?? 0}
@@ -707,6 +999,19 @@ export default function SurgicalDashboard() {
           tone="amber"
         />
       )}
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-0 z-40"
+        style={{
+          opacity: handDetected ? 1 : 0,
+          background: frameColor,
+          transition: "opacity 500ms ease-out, background-color 450ms ease-in-out",
+          maskImage: frameMask,
+          WebkitMaskImage: frameMask,
+          maskComposite: "add",
+          WebkitMaskComposite: "source-over",
+        }}
+      />
     </div>
   );
 }

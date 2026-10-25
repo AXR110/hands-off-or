@@ -69,6 +69,31 @@ MAX_READ_FAILURES = 60  # consecutive dropped reads before giving up (~2 s at ca
 
 # --- hand tracking ---------------------------------------------------------
 
+# OpenCV hue is 0-179. Blue latex sits in this band; bare skin is near 0-25.
+_BLUE_HUE_LOW = 85
+_BLUE_HUE_HIGH = 135
+_BLUE_MIN_SATURATION = 40
+_SKIN_HUE = np.uint8(12)
+
+
+def _frame_for_landmarker(frame_bgr: np.ndarray) -> np.ndarray:
+    """RGB frame for MediaPipe, with blue latex shifted toward skin tone.
+
+    A full red/blue swap makes a glove look warm, but it also turns a bare
+    hand blue, so the landmarker drops it. Only saturated blue pixels move.
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    blue = (
+        (hue >= _BLUE_HUE_LOW)
+        & (hue <= _BLUE_HUE_HIGH)
+        & (hsv[:, :, 1] >= _BLUE_MIN_SATURATION)
+    )
+    if np.any(blue):
+        hsv[:, :, 0] = np.where(blue, _SKIN_HUE, hue)
+        frame_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
 
 class HandTracker:
     """MediaPipe Hand Landmarker in VIDEO mode; returns up to two hands."""
@@ -77,8 +102,8 @@ class HandTracker:
         self,
         model_path: Path,
         *,
-        min_detection_confidence: float = 0.5,
-        min_tracking_confidence: float = 0.5,
+        min_detection_confidence: float = 0.4,
+        min_tracking_confidence: float = 0.4,
     ) -> None:
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
@@ -92,7 +117,7 @@ class HandTracker:
         self._last_timestamp_ms = 0
 
     def detect(self, frame_bgr: np.ndarray) -> list[Sequence[Any]]:
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        rgb = _frame_for_landmarker(frame_bgr)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
         # VIDEO mode requires strictly increasing timestamps.
         timestamp_ms = max(int(time.monotonic() * 1000), self._last_timestamp_ms + 1)
@@ -552,8 +577,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=0.40,
         help="Normalized thumb-index distance above which a pinch ends.",
     )
-    parser.add_argument("--min-detection-confidence", type=float, default=0.5)
-    parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
+    parser.add_argument("--min-detection-confidence", type=float, default=0.4)
+    parser.add_argument("--min-tracking-confidence", type=float, default=0.4)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
