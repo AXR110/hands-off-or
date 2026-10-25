@@ -1,8 +1,4 @@
-"""Failing RED test for surgical speech log after wake word.
-
-This test must fail with ImportError/AttributeError/TypeError until
-VoiceSpeechLog, WakeListener.log_queue and send_speech_logs are added to voice.py.
-"""
+"""Microphone transcript, end-word buffering, and speech-log frame tests."""
 
 import asyncio
 import json
@@ -12,6 +8,10 @@ import unittest
 
 
 def _install_stubs():
+    sounddevice = types.ModuleType("sounddevice")
+    sounddevice.PortAudioError = type("PortAudioError", (Exception,), {})
+    sys.modules["sounddevice"] = sounddevice
+
     # speech_recognition stub
     sr = types.ModuleType("speech_recognition")
     sr.WaitTimeoutError = type("WaitTimeoutError", (Exception,), {})
@@ -112,6 +112,7 @@ class TestVoiceSpeechLog(unittest.TestCase):
             queue=audio_queue,
             log_queue=log_queue,
         )
+        wl._command_buffer.end_word_pause_ms = 0
 
         # Patch the internal loop object (not wl.loop)
         class FakeLoop:
@@ -139,7 +140,7 @@ class TestVoiceSpeechLog(unittest.TestCase):
         self.assertEqual(log_queue.qsize(), 0)
         self.assertTrue(audio_queue.empty())
 
-        # script 3: "Log, add sponge." -> recording + audio utterance
+        # The transcript and audio stay buffered until the end word arrives.
         recognizer.listen = self._make_listen(["Log, add sponge."])
         try:
             wl._loop_listen()
@@ -147,13 +148,9 @@ class TestVoiceSpeechLog(unittest.TestCase):
             pass
         self.assertEqual(log_queue.qsize(), 1)
         self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "recording", "text": "add sponge"})
-        self.assertEqual(audio_queue.qsize(), 1)
-        utt = audio_queue.get_nowait()
-        self.assertIsInstance(utt, voice.CapturedUtterance)
-        self.assertEqual(utt.transcript, "Log, add sponge.")
-        self.assertEqual(utt.pcm, b"\x00\x01")
+        self.assertTrue(audio_queue.empty())
 
-        # script 4: "and two clamps" -> append recording (no PCM)
+        # Additional stable phrases accumulate in the same open command.
         recognizer.listen = self._make_listen(["and two clamps"])
         try:
             wl._loop_listen()
@@ -163,23 +160,29 @@ class TestVoiceSpeechLog(unittest.TestCase):
         self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "recording", "text": "add sponge and two clamps"})
         self.assertTrue(audio_queue.empty())
 
-        # script 5: one 1.0s timeout after words must NOT finalize yet
-        recognizer.listen = self._make_listen(["timeout"])
+        # The terminal word is removed from the visible transcript, and the
+        # combined audio is submitted only after the short stability pause.
+        recognizer.listen = self._make_listen(["over"])
         try:
             wl._loop_listen()
         except RuntimeError:
             pass
-        self.assertEqual(log_queue.qsize(), 0)
+        self.assertEqual(log_queue.qsize(), 1)
+        self.assertEqual(
+            log_queue.get_nowait(),
+            {"type": "speech_log", "phase": "recording", "text": "add sponge and two clamps"},
+        )
+        self.assertTrue(audio_queue.empty())
 
-        # script 6: second timeout reaches 2.0s total -> final + idle
-        recognizer.listen = self._make_listen(["timeout"])
-        try:
-            wl._loop_listen()
-        except RuntimeError:
-            pass
+        wl._poll_command()
         self.assertEqual(log_queue.qsize(), 2)
         self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "final", "text": "add sponge and two clamps"})
         self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "idle", "text": ""})
+        self.assertEqual(audio_queue.qsize(), 1)
+        utterance = audio_queue.get_nowait()
+        self.assertIsInstance(utterance, voice.CapturedUtterance)
+        self.assertEqual(utterance.transcript, "add sponge and two clamps")
+        self.assertEqual(utterance.pcm, b"\x00\x01" * 3)
 
     def test_record_button_arms_the_next_phrase(self):
         recognizer = self.sr.Recognizer()
@@ -200,6 +203,7 @@ class TestVoiceSpeechLog(unittest.TestCase):
             queue=audio_queue,
             log_queue=log_queue,
         )
+        wl._command_buffer.end_word_pause_ms = 0
 
         class FakeLoop:
             def call_soon_threadsafe(self, fn, arg):
@@ -211,9 +215,9 @@ class TestVoiceSpeechLog(unittest.TestCase):
             log_queue.get_nowait(),
             {"type": "speech_log", "phase": "recording", "text": ""},
         )
-        self.assertIsNotNone(wl._command_deadline)
+        self.assertTrue(wl._command_buffer.active)
 
-        recognizer.listen = self._make_listen(["add sponge"])
+        recognizer.listen = self._make_listen(["add sponge over"])
         try:
             wl._loop_listen()
         except RuntimeError:
@@ -222,6 +226,13 @@ class TestVoiceSpeechLog(unittest.TestCase):
             log_queue.get_nowait(),
             {"type": "speech_log", "phase": "recording", "text": "add sponge"},
         )
+        self.assertTrue(audio_queue.empty())
+        wl._poll_command()
+        self.assertEqual(
+            log_queue.get_nowait(),
+            {"type": "speech_log", "phase": "final", "text": "add sponge"},
+        )
+        self.assertEqual(log_queue.get_nowait(), {"type": "speech_log", "phase": "idle", "text": ""})
         self.assertEqual(audio_queue.qsize(), 1)
         self.assertEqual(audio_queue.get_nowait().transcript, "add sponge")
 

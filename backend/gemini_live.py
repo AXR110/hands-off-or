@@ -1,7 +1,8 @@
 """Drain the bridge audio buffer into a Gemini Live session.
 
 Voice captures 16 kHz mono PCM16 and the bridge stores it. This task forwards
-each utterance, then ``audioStreamEnd``, so the model commits the turn and can
+each completed command between explicit activity start/end markers, so the
+model commits the turn only after the end word and can
 request ``log_instrument`` or ``verify_tray_count``. The server executes those
 calls and sends the tool response back on this socket.
 """
@@ -37,6 +38,7 @@ IDLE_POLL_S = 0.05
 SYSTEM_INSTRUCTION = (
     "You are the instrument logger for a sterile operating room. "
     "The surgeon speaks a command after the wake word. "
+    "The word 'over' is the end-of-command delimiter; ignore it and do not treat it as part of the command. "
     "When they add, remove, or use an instrument, call log_instrument. "
     "added and removed change the running tray count; used records use and does not. "
     "Quantity defaults to 1. "
@@ -77,6 +79,9 @@ def _setup_message(system_instruction: str | None = None) -> dict[str, Any]:
         "setup": {
             "model": _model_name(),
             "generationConfig": {"responseModalities": ["AUDIO"]},
+            "realtimeInputConfig": {
+                "automaticActivityDetection": {"disabled": True},
+            },
             "systemInstruction": {"parts": [{"text": instruction}]},
             "tools": [{"functionDeclarations": live_function_declarations()}],
         }
@@ -101,11 +106,12 @@ def _redact(text: str, key: str) -> str:
 
 
 async def _send_utterance(websocket: Any, pcm: bytes) -> None:
+    await websocket.send(json.dumps({"realtimeInput": {"activityStart": {}}}))
     for start in range(0, len(pcm), CHUNK_BYTES):
         piece = pcm[start : start + CHUNK_BYTES]
         if piece:
             await websocket.send(_audio_message(piece))
-    await websocket.send(json.dumps({"realtimeInput": {"audioStreamEnd": True}}))
+    await websocket.send(json.dumps({"realtimeInput": {"activityEnd": {}}}))
 
 
 async def _pump_audio(websocket: Any, drain: AudioDrain, ready: asyncio.Event) -> None:

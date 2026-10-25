@@ -1,16 +1,15 @@
 """Microphone wake-word listener that feeds the bridge audio buffer.
 
 A daemon thread continuously reads the microphone with SpeechRecognition.
-When a phrase contains the wake word "log", the captured utterance is
-forwarded to the bridge as one binary WebSocket frame: byte 0 is ``0x02``
-(audio) and the rest is 16 kHz mono PCM16. ``server.py`` appends that payload
-to the audio ring buffer a Gemini Live media pump drains with
-``POST /api/media/audio/drain``.
+After the wake word "log" or the Record button opens a command buffer,
+transcribed phrases and their audio accumulate until the command ends with
+"over". The stable transcript is shown in the viewer, and the captured audio
+is forwarded as one binary WebSocket frame only after the delimiter survives a
+short pause. A silence timeout discards stale commands.
 
-A phrase that is only the wake word arms a short window; the next phrase is
-captured and forwarded as the command. The transcript is used only to spot
-the wake word (Google Web Speech, via SpeechRecognition). The audio itself
-is what Gemini hears.
+The audio frame uses byte 0 as the ``0x02`` channel tag and the rest as 16 kHz
+mono PCM16. ``server.py`` appends it to the audio ring buffer that the Gemini
+Live media pump drains with ``POST /api/media/audio/drain``.
 
 Function calls for ``log_instrument`` and ``verify_tray_count`` that the
 bridge relays back are executed with ``tools.dispatch`` and answered with a
@@ -66,6 +65,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from tools import TOOL_NAMES, ToolError, dispatch
+from end_word import END_WORD, END_WORD_PAUSE_MS, EndWordBuffer
 from speech_log import SpeechLogSession
 
 LOG = logging.getLogger("voice")
@@ -80,9 +80,8 @@ SAMPLE_WIDTH = 2  # PCM16, little-endian
 # Fixed gate. A loud floor plus dynamic adjustment climbs above a speaking voice.
 ENERGY_THRESHOLD = 300
 AMBIENT_CALIBRATION_S = 1.5
-COMMAND_WINDOW_S = 6.0
 RECONNECT_DELAY_S = 2.0
-LISTEN_TIMEOUT_S = 1.0
+LISTEN_TIMEOUT_S = max(0.05, min(1.0, END_WORD_PAUSE_MS / 1000))
 QUEUE_SIZE = 8
 VOICE_STATUS_INTERVAL_S = 1.0
 
@@ -329,7 +328,7 @@ def _prepare_microphone(recognizer: sr.Recognizer, microphone: sr.AudioSource) -
 
 
 class WakeListener:
-    """Background thread: ``Recognizer.listen`` until the wake word is heard."""
+    """Listen continuously; buffer command text and audio until its end word."""
 
     def __init__(
         self,
@@ -350,10 +349,11 @@ class WakeListener:
         self._loop = loop
         self._queue = queue
         self._log_queue: asyncio.Queue[dict[str, str]] = log_queue or asyncio.Queue()
-        self._speech_log = VoiceSpeechLog(wake_word)
+        self._command_buffer = EndWordBuffer()
+        self._command_audio: list[bytes] = []
+        self._command_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._command_deadline: float | None = None
         self.mic_open = False
 
     def start(self) -> None:
@@ -370,10 +370,12 @@ class WakeListener:
             thread.join(timeout=self._phrase_time_limit + LISTEN_TIMEOUT_S + 1.0)
 
     def arm_from_button(self) -> None:
-        """Same capture window as a bare "log": record the next phrase."""
-        self._arm()
-        self._enqueue_logs(self._speech_log.on_manual_start())
-        LOG.info("record button pressed; capturing the next phrase")
+        """Open a command buffer when the Record button is pressed."""
+        with self._command_lock:
+            self._command_audio.clear()
+            events = self._command_buffer.start(time.monotonic() * 1000)
+        self._enqueue_logs(events)
+        LOG.info("record button pressed; listening for a command ending in %r", END_WORD)
 
     def _loop_listen(self) -> None:
         try:
@@ -382,12 +384,6 @@ class WakeListener:
                     raise OSError("microphone stream did not open")
                 self.mic_open = True
                 while not self._stop.is_set():
-                    # The record window limits how long we wait for speech to
-                    # start. The phrase itself may end after that deadline.
-                    armed_for_phrase = (
-                        self._command_deadline is not None
-                        and time.monotonic() <= self._command_deadline
-                    )
                     try:
                         audio = self._recognizer.listen(
                             source,
@@ -395,16 +391,10 @@ class WakeListener:
                             phrase_time_limit=self._phrase_time_limit,
                         )
                     except sr.WaitTimeoutError:
-                        self._enqueue_logs(self._speech_log.on_listen_timeout())
-                        if (
-                            self._command_deadline is not None
-                            and time.monotonic() > self._command_deadline
-                        ):
-                            LOG.info("command window elapsed; waiting for the wake word again")
-                            self._command_deadline = None
+                        self._poll_command()
                         continue
                     try:
-                        self._handle(audio, keep_command=armed_for_phrase)
+                        self._handle(audio)
                     except Exception:
                         LOG.exception("wake listener failed on a phrase")
         except Exception:
@@ -412,24 +402,11 @@ class WakeListener:
         finally:
             self.mic_open = False
 
-    def _handle(self, audio: sr.AudioData, keep_command: bool = False) -> None:
-        now = time.monotonic()
-        armed = keep_command or (
-            self._command_deadline is not None and now <= self._command_deadline
-        )
-        if self._command_deadline is not None and not armed:
-            LOG.info("command window elapsed; waiting for the wake word again")
-            self._command_deadline = None
-
+    def _handle(self, audio: sr.AudioData) -> None:
         try:
             transcript = self._recognizer.recognize_google(audio, language=self._language)
         except sr.UnknownValueError:
-            if armed:
-                if self._command_deadline is None or time.monotonic() > self._command_deadline:
-                    self._arm()
-                LOG.info("command was not understood; still listening")
-            else:
-                LOG.debug("unrecognized speech")
+            LOG.debug("unrecognized speech")
             return
         except sr.RequestError as exc:
             LOG.warning("wake-word recognizer unavailable: %s", exc)
@@ -440,37 +417,54 @@ class WakeListener:
         if not transcript:
             return
 
-        self._enqueue_logs(self._speech_log.on_transcript(transcript))
-
-        if armed:
-            self._command_deadline = None
-            followup = wake_remainder(transcript, self._wake_word)
-            if followup == "":
-                self._arm()
-                LOG.info("wake word repeated; still waiting for the command")
-                return
-            self._forward(audio, transcript)
-            return
-
+        with self._command_lock:
+            armed = self._command_buffer.active
         remainder = wake_remainder(transcript, self._wake_word)
-        if remainder is None:
+        if not armed:
+            if remainder is None:
+                return
+            with self._command_lock:
+                self._command_audio.clear()
+                events = self._command_buffer.start(time.monotonic() * 1000)
+            self._enqueue_logs(events)
+            LOG.info("wake word %r heard; listening for a command ending in %r", self._wake_word, END_WORD)
+        phrase = remainder if remainder else transcript
+        if remainder == "":
             return
-        if remainder:
-            self._forward(audio, transcript)
-            return
-        self._arm()
-        LOG.info("wake word %r heard; capturing the next phrase", self._wake_word)
+        if remainder is not None:
+            phrase = remainder
 
-    def _arm(self) -> None:
-        self._command_deadline = time.monotonic() + COMMAND_WINDOW_S
-
-    def _forward(self, audio: sr.AudioData, transcript: str) -> None:
         pcm = audio.get_raw_data(convert_rate=SAMPLE_RATE, convert_width=SAMPLE_WIDTH)
-        if not pcm:
-            LOG.warning("captured audio was empty")
+        with self._command_lock:
+            if not self._command_buffer.active:
+                return
+            self._command_audio.append(pcm)
+            events = self._command_buffer.append(phrase, time.monotonic() * 1000)
+        self._enqueue_logs(events)
+        self._send_completed_if_ready(events)
+
+    def _poll_command(self) -> None:
+        with self._command_lock:
+            events = self._command_buffer.poll(time.monotonic() * 1000)
+        if events and events[-1]["phase"] == "idle":
+            self._enqueue_logs(events)
+            self._send_completed_if_ready(events)
+
+    def _send_completed_if_ready(self, events: list[dict[str, str]]) -> None:
+        final = next((event for event in events if event["phase"] == "final"), None)
+        if final is None:
+            if events and events[-1]["phase"] == "idle":
+                with self._command_lock:
+                    self._command_audio.clear()
             return
-        utterance = CapturedUtterance(pcm=pcm, transcript=transcript)
-        LOG.info("wake word matched; forwarding %r (%d bytes pcm16)", transcript, len(pcm))
+        with self._command_lock:
+            pcm = b"".join(self._command_audio)
+            self._command_audio.clear()
+        if not pcm:
+            LOG.warning("completed voice command had no audio")
+            return
+        utterance = CapturedUtterance(pcm=pcm, transcript=final["text"])
+        LOG.info("end word matched; forwarding %r (%d bytes pcm16)", final["text"], len(pcm))
         try:
             self._loop.call_soon_threadsafe(self._enqueue, utterance)
         except RuntimeError:

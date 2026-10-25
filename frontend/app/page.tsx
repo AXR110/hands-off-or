@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import ImageViewer from "../components/ImageViewer";
-import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
+import { emptySpeechLog, applySpeechLog, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 
@@ -20,6 +20,31 @@ function bridgeHttpOrigin() {
   const url = new URL(BRIDGE_URL);
   url.protocol = url.protocol === "wss:" ? "https:" : "http:";
   return url.origin;
+}
+
+function playSentChime() {
+  if (typeof window === "undefined" || !window.AudioContext) return;
+  const context = new window.AudioContext();
+  void context
+    .resume()
+    .then(() => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      oscillator.frequency.value = 880;
+      gain.gain.setValueAtTime(0.12, context.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.16);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.onended = () => {
+        void context.close();
+      };
+      oscillator.start();
+      oscillator.stop(context.currentTime + 0.16);
+    })
+    .catch((error: unknown) => {
+      console.warn("Could not play the command confirmation chime.", error);
+      void context.close();
+    });
 }
 
 function facilitiesFromNearbyResponse(body: { local_results?: unknown }): NearbyFacility[] {
@@ -119,6 +144,7 @@ type PinchMark = {
 
 type PickedImageFile = { name: string; type: string; data_base64: string };
 type PickedImagesFrame = {
+  type: "picked_images";
   cancelled?: boolean;
   error?: string;
   files?: PickedImageFile[];
@@ -385,6 +411,24 @@ type FunctionResultFrame = {
   server_ts?: number;
 };
 
+type SpeechLogFrame = {
+  type: "speech_log";
+  phase: "recording" | "final" | "idle";
+  text: string;
+  server_ts?: number;
+};
+
+type VoiceStatusFrame = { type: "voice_status"; active?: boolean };
+
+type IncomingBridgeFrame =
+  | Telemetry
+  | FunctionCallFrame
+  | StateSnapshotFrame
+  | FunctionResultFrame
+  | PickedImagesFrame
+  | SpeechLogFrame
+  | VoiceStatusFrame;
+
 type ToolCall = {
   callId: string;
   name: string;
@@ -403,6 +447,7 @@ function useBridge() {
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [speechLog, setSpeechLog] = useState<SpeechLogView>(emptySpeechLog());
   const [voiceLive, setVoiceLive] = useState(false);
+  const [commandSent, setCommandSent] = useState(false);
   const seenCalls = useRef(new Set<string>());
   const socketRef = useRef<WebSocket | null>(null);
   const pickedImagesHandler = useRef<(frame: PickedImagesFrame) => void>(() => {});
@@ -411,6 +456,7 @@ function useBridge() {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let handDetectionTimer: ReturnType<typeof setTimeout> | null = null;
     let voiceStatusTimer: ReturnType<typeof setTimeout> | null = null;
+    let commandSentTimer: ReturnType<typeof setTimeout> | null = null;
     let attempts = 0;
     let disposed = false;
 
@@ -465,20 +511,31 @@ function useBridge() {
 
       socketRef.current.onmessage = (event) => {
         if (typeof event.data !== "string") return;
-        let frame: Telemetry | FunctionCallFrame | StateSnapshotFrame;
+        let frame: IncomingBridgeFrame;
         try {
           frame = JSON.parse(event.data);
         } catch {
           return;
         }
-        if ((frame as any).type === "speech_log") {
-          setSpeechLog((prev) => applySpeechLog(prev, frame as any));
+        if (frame.type === "speech_log") {
+          setSpeechLog((prev) => applySpeechLog(prev, frame));
+          if (frame.phase === "recording") {
+            setCommandSent(false);
+          } else if (frame.phase === "final") {
+            setCommandSent(true);
+            playSentChime();
+            if (commandSentTimer) clearTimeout(commandSentTimer);
+            commandSentTimer = setTimeout(() => {
+              setCommandSent(false);
+              commandSentTimer = null;
+            }, 1800);
+          }
         }
-        if ((frame as { type?: string }).type === "picked_images") {
-          pickedImagesHandler.current(frame as PickedImagesFrame);
+        if (frame.type === "picked_images") {
+          pickedImagesHandler.current(frame);
         }
-        if ((frame as { type?: string }).type === "voice_status") {
-          const active = (frame as { active?: boolean }).active !== false;
+        if (frame.type === "voice_status") {
+          const active = frame.active !== false;
           if (voiceStatusTimer) clearTimeout(voiceStatusTimer);
           voiceStatusTimer = null;
           if (!active) {
@@ -497,8 +554,8 @@ function useBridge() {
           if (frame.telemetry) updateTelemetry(frame.telemetry);
         } else if (frame.type === "function_call") {
           recordCall(frame);
-        } else if ((frame as { type?: string }).type === "function_result") {
-          const resultFrame = frame as FunctionResultFrame;
+        } else if (frame.type === "function_result") {
+          const resultFrame = frame;
           setCalls((previous) =>
             previous.map((call) =>
               call.callId === resultFrame.call_id
@@ -527,6 +584,7 @@ function useBridge() {
       if (retryTimer) clearTimeout(retryTimer);
       if (handDetectionTimer) clearTimeout(handDetectionTimer);
       if (voiceStatusTimer) clearTimeout(voiceStatusTimer);
+      if (commandSentTimer) clearTimeout(commandSentTimer);
       socketRef.current?.close();
     };
   }, []);
@@ -555,6 +613,7 @@ function useBridge() {
     counts,
     speechLog,
     voiceLive,
+    commandSent,
     startRecording,
     requestImagePick,
     pickedImagesHandler,
@@ -629,6 +688,7 @@ export default function SurgicalDashboard() {
     handDetected,
     speechLog,
     voiceLive,
+    commandSent,
     startRecording,
     requestImagePick,
     pickedImagesHandler,
@@ -1537,15 +1597,19 @@ export default function SurgicalDashboard() {
                     speechLog.recording ? "log" : voiceLive ? "on" : "off"
                   }
                   className={`h-1.5 w-1.5 rounded-full ${
-                    speechLog.recording
+                    commandSent
+                      ? "border-emerald-400 bg-emerald-400"
+                      : speechLog.recording
                       ? "voice-live-dot"
                       : voiceLive
                         ? "bg-sky-400"
                         : "bg-slate-600"
                   }`}
                 />
-                {speechLog.recording
-                  ? speechLogStatusLabel(speechLog)
+                {commandSent
+                  ? "Sent"
+                  : speechLog.recording
+                    ? "Listening..."
                   : voiceLive
                     ? "Listening for log"
                     : "Voice off"}
