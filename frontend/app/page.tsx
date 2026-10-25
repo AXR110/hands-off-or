@@ -9,6 +9,10 @@ const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws
 const LOG_LIMIT = 50;
 const HAND_DETECTION_TIMEOUT_MS = 500;
 const VOICE_STATUS_TIMEOUT_MS = 3000;
+const WAKE_HOLD_MS = 1000;
+const WAKE_MISSED_FRAME_TOLERANCE = 5;
+const WAKE_NO_HAND_SLEEP_MS = 10_000;
+const WAKE_PULSE_MS = 700;
 // Hue eases across this band instead of flipping at a hard edge.
 const EDGE_BLEND_START = 0.14;
 const EDGE_BLEND_END = 0.025;
@@ -520,11 +524,17 @@ function PointerCursor({
   x,
   y,
   pinched,
+  awake,
+  wakeProgress,
+  wakePulse,
   tone = "sky",
 }: {
   x: number;
   y: number;
   pinched: boolean;
+  awake: boolean;
+  wakeProgress: number;
+  wakePulse: boolean;
   tone?: "sky" | "amber";
 }) {
   const open =
@@ -542,11 +552,22 @@ function PointerCursor({
       className="pointer-events-none fixed z-50 transition-[left,top] duration-100 ease-linear"
       style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
     >
-      <div
-        className={`-translate-x-1/2 -translate-y-1/2 rounded-full transition-all duration-150 ease-out ${
-          pinched ? closed : open
-        }`}
-      />
+      {awake ? (
+        <div
+          className={`-translate-x-1/2 -translate-y-1/2 rounded-full transition-all duration-150 ease-out ${
+            pinched ? closed : open
+          } ${wakePulse ? "animate-pulse" : ""}`}
+        />
+      ) : (
+        <div
+          className="-translate-x-1/2 -translate-y-1/2 flex h-10 w-10 items-center justify-center rounded-full"
+          style={{
+            background: `conic-gradient(#38bdf8 ${wakeProgress * 360}deg, rgba(148, 163, 184, 0.35) 0deg)`,
+          }}
+        >
+          <div className="h-8 w-8 rounded-full bg-[#05070d]" />
+        </div>
+      )}
     </div>
   );
 }
@@ -569,12 +590,22 @@ export default function SurgicalDashboard() {
   const [scale, setScale] = useState(MIN_ZOOM);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [hovered, setHovered] = useState<StudyId | null>(null);
+  const [awake, setAwake] = useState(false);
+  const [wakeProgress, setWakeProgress] = useState(0);
+  const [wakePulse, setWakePulse] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadedUrls = useRef(new Set<string>());
   const scaleRef = useRef(MIN_ZOOM);
   const panRef = useRef<Point>({ x: 0, y: 0 });
   const zoomGesture = useRef<ZoomGesture | null>(null);
   const pinchEdge = useRef({ primary: false, secondary: false });
+  const awakeRef = useRef(false);
+  const wakeReleaseRequired = useRef(false);
+  const wakeGesture = useRef<{ startedAt: number | null; missedFrames: number }>({
+    startedAt: null,
+    missedFrames: 0,
+  });
+  const wakePulseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
   const lastPrimaryPinch = useRef<PinchMark | null>(null);
@@ -786,9 +817,32 @@ export default function SurgicalDashboard() {
     () => () => {
       for (const url of uploadedUrls.current) URL.revokeObjectURL(url);
       uploadedUrls.current.clear();
+      if (wakePulseTimer.current) clearTimeout(wakePulseTimer.current);
     },
     [],
   );
+
+  useEffect(() => {
+    if (handDetected) return;
+    const sleepTimer = setTimeout(() => {
+      awakeRef.current = false;
+      wakeReleaseRequired.current = false;
+      setAwake(false);
+      setWakeProgress(0);
+      setWakePulse(false);
+      wakeGesture.current = { startedAt: null, missedFrames: 0 };
+      zoomGesture.current = null;
+      swipeGesture.current = null;
+      lastPrimaryPinch.current = null;
+      lastSecondaryPinch.current = null;
+      pinchEdge.current = { primary: false, secondary: false };
+      if (wakePulseTimer.current) {
+        clearTimeout(wakePulseTimer.current);
+        wakePulseTimer.current = null;
+      }
+    }, WAKE_NO_HAND_SLEEP_MS);
+    return () => clearTimeout(sleepTimer);
+  }, [handDetected]);
 
   const appendSwipe = (x: number, y: number) => {
     const gesture = swipeGesture.current;
@@ -844,14 +898,69 @@ export default function SurgicalDashboard() {
 
   useEffect(() => {
     if (!telemetry) return;
+    if (!awakeRef.current) {
+      const now = performance.now();
+      const wake = wakeGesture.current;
+      if (telemetry.pinch_active) {
+        if (wake.startedAt == null) wake.startedAt = now;
+        wake.missedFrames = 0;
+        const progress = clamp((now - wake.startedAt) / WAKE_HOLD_MS, 0, 1);
+        setWakeProgress(progress);
+        if (progress >= 1) {
+          awakeRef.current = true;
+          wakeReleaseRequired.current = true;
+          setAwake(true);
+          setWakeProgress(0);
+          setWakePulse(true);
+          wake.startedAt = null;
+          wake.missedFrames = 0;
+          if (wakePulseTimer.current) clearTimeout(wakePulseTimer.current);
+          wakePulseTimer.current = setTimeout(() => {
+            setWakePulse(false);
+            wakePulseTimer.current = null;
+          }, WAKE_PULSE_MS);
+        }
+      } else if (wake.startedAt != null) {
+        wake.missedFrames += 1;
+        if (wake.missedFrames > WAKE_MISSED_FRAME_TOLERANCE) {
+          wake.startedAt = null;
+          wake.missedFrames = 0;
+          setWakeProgress(0);
+        }
+      }
+      pinchEdge.current = {
+        primary: telemetry.pinch_active,
+        secondary: Boolean(telemetry.pinch2_active),
+      };
+      zoomGesture.current = null;
+      swipeGesture.current = null;
+      lastPrimaryPinch.current = null;
+      lastSecondaryPinch.current = null;
+      setHovered(null);
+      return;
+    }
+
     const x2 = telemetry.x2;
     const y2 = telemetry.y2;
     const pinch2 = telemetry.pinch2_active;
     const second =
       typeof x2 === "number" && typeof y2 === "number" && typeof pinch2 === "boolean";
+    const secondPinchActive = second && pinch2 === true;
+    if (wakeReleaseRequired.current) {
+      pinchEdge.current = {
+        primary: telemetry.pinch_active,
+        secondary: secondPinchActive,
+      };
+      zoomGesture.current = null;
+      swipeGesture.current = null;
+      if (telemetry.pinch_active || secondPinchActive) {
+        setHovered(null);
+        return;
+      }
+      wakeReleaseRequired.current = false;
+    }
     const both = telemetry.pinch_active && second && pinch2 === true;
     const stage = stageRef.current?.getBoundingClientRect();
-    const secondPinchActive = second && pinch2 === true;
     const anyPinch = telemetry.pinch_active || secondPinchActive;
     const primaryOnly = telemetry.pinch_active && !secondPinchActive;
     const secondaryOnly = secondPinchActive && !telemetry.pinch_active;
@@ -1065,6 +1174,29 @@ export default function SurgicalDashboard() {
             </span>
             {status === "online" ? "Bridge online" : status === "connecting" ? "Connecting" : "Reconnecting"}
           </span>
+          <span
+            role="status"
+            aria-live="polite"
+            className={`flex items-center gap-2 rounded-full border px-3 py-1 text-[10px] font-medium tracking-[0.18em] uppercase ${
+              awake
+                ? "border-sky-400/50 bg-sky-400/10 text-sky-200"
+                : "border-slate-600/50 bg-slate-700/20 text-slate-400"
+            }`}
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${awake ? "bg-sky-300" : "bg-slate-500"}`}
+            />
+            {awake ? "Awake" : "Asleep"}
+          </span>
+          {!awake && (
+            <span className="text-[10px] text-slate-500">
+              {!handDetected
+                ? "No hand detected"
+                : wakeProgress > 0
+                  ? `${Math.round(wakeProgress * 100)}%`
+                  : "Hold pinch 1s"}
+            </span>
+          )}
         </div>
       </header>
 
@@ -1201,11 +1333,15 @@ export default function SurgicalDashboard() {
                 clearHighlighted={hovered === "clear-drawing"}
                 pointer={
                   telemetry
-                    ? { x: telemetry.x, y: telemetry.y, pinch: telemetry.pinch_active }
+                    ? {
+                        x: telemetry.x,
+                        y: telemetry.y,
+                        pinch: awake && telemetry.pinch_active,
+                      }
                     : null
                 }
                 secondaryPointer={
-                  secondHand && telemetry
+                  awake && secondHand && telemetry
                     ? {
                         x: telemetry.x2 ?? 0,
                         y: telemetry.y2 ?? 0,
@@ -1318,13 +1454,23 @@ export default function SurgicalDashboard() {
       </div>
 
       {handDetected && telemetry && (
-        <PointerCursor x={telemetry.x} y={telemetry.y} pinched={telemetry.pinch_active} />
+        <PointerCursor
+          x={telemetry.x}
+          y={telemetry.y}
+          pinched={telemetry.pinch_active}
+          awake={awake}
+          wakeProgress={wakeProgress}
+          wakePulse={wakePulse}
+        />
       )}
-      {handDetected && secondHand && telemetry && (
+      {awake && handDetected && secondHand && telemetry && (
         <PointerCursor
           x={telemetry.x2 ?? 0}
           y={telemetry.y2 ?? 0}
           pinched={secondPinch}
+          awake={awake}
+          wakeProgress={0}
+          wakePulse={wakePulse}
           tone="amber"
         />
       )}
