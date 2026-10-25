@@ -71,7 +71,7 @@ body {
 @keyframes voice-hue-pulse {
   0%,
   100% {
-    background: hsla(198.44, 93.2%, 59.61%, 0.3);
+    background: hsla(142, 72%, 45%, 0.28);
   }
   50% {
     background: hsla(142, 72%, 52%, 0.55);

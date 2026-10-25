@@ -1254,12 +1254,11 @@ export default function SurgicalDashboard() {
         data-voice-live={voiceLive ? "on" : "off"}
         data-log-hue={speechLog.recording ? "on" : "off"}
         className={`pointer-events-none fixed inset-0 z-40 ${
-          speechLog.recording && edgeAmount <= 0 ? "voice-live-hue" : ""
+          speechLog.recording ? "voice-live-hue" : ""
         }`}
         style={{
           opacity: speechLog.recording || handDetected ? 1 : 0,
-          background:
-            speechLog.recording && edgeAmount <= 0 ? undefined : frameColor,
+          background: speechLog.recording ? undefined : frameColor,
           transition: "opacity 500ms ease-out",
           maskImage: frameMask,
           WebkitMaskImage: frameMask,
