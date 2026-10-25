@@ -77,8 +77,8 @@ class HandTracker:
         self,
         model_path: Path,
         *,
-        min_detection_confidence: float = 0.5,
-        min_tracking_confidence: float = 0.5,
+        min_detection_confidence: float = 0.4,
+        min_tracking_confidence: float = 0.4,
     ) -> None:
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
@@ -92,8 +92,11 @@ class HandTracker:
         self._last_timestamp_ms = 0
 
     def detect(self, frame_bgr: np.ndarray) -> list[Sequence[Any]]:
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        # OpenCV frames are BGR. Passing them as SRGB swaps red and blue, so a
+        # blue latex glove (high B, low R) is read as a warm orange skin tone.
+        image = mp.Image(
+            image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame_bgr)
+        )
         # VIDEO mode requires strictly increasing timestamps.
         timestamp_ms = max(int(time.monotonic() * 1000), self._last_timestamp_ms + 1)
         self._last_timestamp_ms = timestamp_ms
@@ -552,8 +555,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=0.40,
         help="Normalized thumb-index distance above which a pinch ends.",
     )
-    parser.add_argument("--min-detection-confidence", type=float, default=0.5)
-    parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
+    parser.add_argument("--min-detection-confidence", type=float, default=0.4)
+    parser.add_argument("--min-tracking-confidence", type=float, default=0.4)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
