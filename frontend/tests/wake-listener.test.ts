@@ -6,6 +6,7 @@ import { planWakeListener } from "../scripts/wake-listener.mjs";
 
 test('planWakeListener win32 not running', () => {
   const result = planWakeListener({ platform: "win32", alreadyRunning: false, scriptDir: "C:/app/frontend/scripts" });
+  assert.ok(result);
   assert.strictEqual(result.command, "python");
   assert.match(result.args[0], /voice\.py$/);
   assert.match(result.cwd, /backend$/);
@@ -13,6 +14,7 @@ test('planWakeListener win32 not running', () => {
 
 test('planWakeListener linux not running', () => {
   const result = planWakeListener({ platform: "linux", alreadyRunning: false, scriptDir: "/app/frontend/scripts" });
+  assert.ok(result);
   assert.strictEqual(result.command, "python3");
   assert.match(result.args[0], /voice\.py$/);
 });
