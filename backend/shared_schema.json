@@ -3,15 +3,16 @@
   "$id": "https://pointer-bridge.local/shared_schema.json",
   "title": "Pointer telemetry bridge protocol",
   "description": "Wire contract shared by the input device, viewer/overlay clients and the Gemini bridge. Every JSON message is one UTF-8 text WebSocket frame carrying a discriminating `type` field; binary frames carry media (see $defs/mediaFrame). Coordinates are normalized to the unit square with (0,0) at the top-left of the input surface, so every client can rescale to its own viewport. The root schema is the union of all JSON frames in either direction; per-definition descriptions state their direction.",
-  "oneOf": [
-    { "$ref": "#/$defs/telemetry" },
-    { "$ref": "#/$defs/telemetryEvent" },
-    { "$ref": "#/$defs/functionCall" },
-    { "$ref": "#/$defs/functionResult" },
-    { "$ref": "#/$defs/videoFrame" },
-    { "$ref": "#/$defs/stateSnapshot" },
-    { "$ref": "#/$defs/protocolError" }
-  ],
+   "oneOf": [
+     { "$ref": "#/$defs/telemetry" },
+     { "$ref": "#/$defs/telemetryEvent" },
+     { "$ref": "#/$defs/functionCall" },
+     { "$ref": "#/$defs/functionResult" },
+     { "$ref": "#/$defs/videoFrame" },
+     { "$ref": "#/$defs/speechLog" },
+     { "$ref": "#/$defs/stateSnapshot" },
+     { "$ref": "#/$defs/protocolError" }
+   ],
   "$defs": {
     "clientRole": {
       "type": "string",
@@ -328,6 +329,25 @@
           "type": "string",
           "description": "Opaque encoded bytes, frame[1:]."
         }
+      }
+    },
+    "speechLog": {
+      "type": "object",
+      "description": "input -> server (and server -> clients). Speech transcript remainder after the wake word for the surgical log. Inbound from input role only; server broadcasts with source and server_ts. phase=final carries the text to display.",
+      "required": ["type", "phase", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "speech_log" },
+        "phase": {
+          "type": "string",
+          "enum": ["recording", "final", "idle"]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "source": { "$ref": "#/$defs/clientId" },
+        "server_ts": { "$ref": "#/$defs/epochMillis" }
       }
     }
   },

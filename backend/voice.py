@@ -37,6 +37,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+
+def _ensure_pyaudio() -> None:
+    """Use PyAudio when installed; otherwise PyAudioWPatch (has a Python 3.14 Windows wheel)."""
+    if "pyaudio" in sys.modules:
+        return
+    try:
+        import pyaudio  # noqa: F401
+    except ImportError:
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            return
+        sys.modules["pyaudio"] = pyaudio
+
+
+_ensure_pyaudio()
+
 import speech_recognition as sr
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -47,6 +64,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from tools import TOOL_NAMES, ToolError, dispatch
+from speech_log import SpeechLogSession
 
 LOG = logging.getLogger("voice")
 
@@ -78,6 +96,26 @@ def wake_remainder(transcript: str, wake_word: str) -> str | None:
     if match is None:
         return None
     return transcript[match.end() :].strip(_TRAILING_PUNCTUATION)
+
+
+class VoiceSpeechLog:
+    """Adapter that turns wake-listener transcripts/timeouts into SpeechLogSession events."""
+
+    def __init__(self, wake_word: str = "log", silence_s: float = 1.5) -> None:
+        self._session = SpeechLogSession(wake_word=wake_word, silence_s=silence_s)
+        self._lock = threading.Lock()
+
+    def on_transcript(self, transcript: str) -> list[dict[str, str]]:
+        with self._lock:
+            return self._session.hear(transcript)
+
+    def on_listen_timeout(self, seconds: float = LISTEN_TIMEOUT_S) -> list[dict[str, str]]:
+        with self._lock:
+            return self._session.gap(seconds)
+
+    def on_manual_start(self) -> list[dict[str, str]]:
+        with self._lock:
+            return self._session.arm()
 
 
 def _client_id(server_url: str) -> str:
@@ -115,6 +153,7 @@ class WakeListener:
         phrase_time_limit: float,
         loop: asyncio.AbstractEventLoop,
         queue: asyncio.Queue[CapturedUtterance],
+        log_queue: asyncio.Queue[dict[str, str]] | None = None,
     ) -> None:
         self._recognizer = recognizer
         self._microphone = microphone
@@ -123,6 +162,8 @@ class WakeListener:
         self._phrase_time_limit = phrase_time_limit
         self._loop = loop
         self._queue = queue
+        self._log_queue: asyncio.Queue[dict[str, str]] = log_queue or asyncio.Queue()
+        self._speech_log = VoiceSpeechLog(wake_word)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._command_deadline: float | None = None
@@ -140,6 +181,9 @@ class WakeListener:
         if thread is not None:
             thread.join(timeout=self._phrase_time_limit + LISTEN_TIMEOUT_S + 1.0)
 
+    def arm_from_button(self) -> None:
+        self._enqueue_logs(self._speech_log.on_manual_start())
+
     def _loop_listen(self) -> None:
         try:
             with self._microphone as source:
@@ -151,6 +195,7 @@ class WakeListener:
                             phrase_time_limit=self._phrase_time_limit,
                         )
                     except sr.WaitTimeoutError:
+                        self._enqueue_logs(self._speech_log.on_listen_timeout())
                         continue
                     try:
                         self._handle(audio)
@@ -182,6 +227,8 @@ class WakeListener:
         LOG.debug("heard %r", transcript)
         if not transcript:
             return
+
+        self._enqueue_logs(self._speech_log.on_transcript(transcript))
 
         if armed:
             self._command_deadline = None
@@ -222,6 +269,21 @@ class WakeListener:
             self._queue.put_nowait(utterance)
         except asyncio.QueueFull:
             LOG.warning("dropped audio; the sender queue is full")
+
+    def _enqueue_logs(self, events: list[dict[str, str]]) -> None:
+        if not events:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._put_logs, events)
+        except RuntimeError:
+            LOG.warning("dropped speech log events; the event loop is closed")
+
+    def _put_logs(self, events: list[dict[str, str]]) -> None:
+        for event in events:
+            try:
+                self._log_queue.put_nowait(event)
+            except asyncio.QueueFull:
+                LOG.warning("dropped speech log event; the sender queue is full")
 
 
 def _result_frame(
@@ -284,7 +346,7 @@ async def _handle_function_call(websocket: Any, payload: dict[str, Any], client_
     await websocket.send(json.dumps(frame))
 
 
-async def receive_frames(websocket: Any, client_id: str) -> None:
+async def receive_frames(websocket: Any, client_id: str, on_start_recording=None) -> None:
     """Execute surgical tool calls the bridge relays from Gemini."""
     async for message in websocket:
         if not isinstance(message, str):
@@ -296,7 +358,10 @@ async def receive_frames(websocket: Any, client_id: str) -> None:
         if not isinstance(payload, dict):
             continue
         kind = payload.get("type")
-        if kind == "error":
+        if kind == "start_recording":
+            if on_start_recording is not None:
+                on_start_recording()
+        elif kind == "error":
             LOG.warning(
                 "server rejected a frame: %s (%s)", payload.get("code"), payload.get("message")
             )
@@ -318,14 +383,24 @@ async def send_audio(websocket: Any, queue: asyncio.Queue[CapturedUtterance]) ->
         )
 
 
+async def send_speech_logs(websocket: Any, queue: asyncio.Queue[dict[str, str]]) -> None:
+    """Send each speech_log event as one JSON text frame."""
+    while True:
+        event = await queue.get()
+        await websocket.send(json.dumps(event))
+
+
 async def session(
     websocket: Any,
     queue: asyncio.Queue[CapturedUtterance],
     client_id: str,
+    log_queue: asyncio.Queue[dict[str, str]],
+    on_start_recording=None,
 ) -> None:
     async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(receive_frames(websocket, client_id), name="voice-receive")
+        tasks.create_task(receive_frames(websocket, client_id, on_start_recording), name="voice-receive")
         tasks.create_task(send_audio(websocket, queue), name="voice-send")
+        tasks.create_task(send_speech_logs(websocket, log_queue), name="voice-speech-log")
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -353,6 +428,7 @@ async def run(args: argparse.Namespace) -> None:
 
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[CapturedUtterance] = asyncio.Queue(maxsize=QUEUE_SIZE)
+    log_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue(maxsize=QUEUE_SIZE)
     listener = WakeListener(
         recognizer,
         microphone,
@@ -361,6 +437,7 @@ async def run(args: argparse.Namespace) -> None:
         args.phrase_time_limit,
         loop,
         queue,
+        log_queue=log_queue,
     )
     listener.start()
     client_id = _client_id(args.server)
@@ -370,7 +447,7 @@ async def run(args: argparse.Namespace) -> None:
                 async with connect(args.server, max_size=None, ping_interval=20) as websocket:
                     LOG.info("connected to %s", args.server)
                     try:
-                        await session(websocket, queue, client_id)
+                        await session(websocket, queue, client_id, log_queue, listener.arm_from_button)
                     except BaseExceptionGroup as exc:
                         if not _is_disconnect(exc):
                             raise

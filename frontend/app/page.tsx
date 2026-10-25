@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
+
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 const LOG_LIMIT = 50;
 const KNOWN_TOOLS = ["set_pointer", "set_pinch"];
@@ -153,10 +155,11 @@ function useBridge() {
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
   const [calls, setCalls] = useState<ToolCall[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
+  const [speechLog, setSpeechLog] = useState<SpeechLogView>(emptySpeechLog());
   const seenCalls = useRef(new Set<string>());
+  const socketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
-    let socket: WebSocket | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let attempts = 0;
     let disposed = false;
@@ -189,20 +192,23 @@ function useBridge() {
     const connect = () => {
       if (disposed) return;
       setStatus("connecting");
-      socket = new WebSocket(url.toString());
+      socketRef.current = new WebSocket(url.toString());
 
-      socket.onopen = () => {
+      socketRef.current.onopen = () => {
         attempts = 0;
         setStatus("online");
       };
 
-      socket.onmessage = (event) => {
+      socketRef.current.onmessage = (event) => {
         if (typeof event.data !== "string") return;
         let frame: Telemetry | FunctionCallFrame | StateSnapshotFrame;
         try {
           frame = JSON.parse(event.data);
         } catch {
           return;
+        }
+        if (frame.type === "speech_log") {
+          setSpeechLog((prev) => applySpeechLog(prev, frame));
         }
         if (frame.type === "telemetry") {
           setTelemetry(frame);
@@ -213,7 +219,7 @@ function useBridge() {
         }
       };
 
-      socket.onclose = () => {
+      socketRef.current.onclose = () => {
         if (disposed) return;
         setStatus("reconnecting");
         const delay = Math.min(5000, 500 * 2 ** attempts);
@@ -221,7 +227,7 @@ function useBridge() {
         retryTimer = setTimeout(connect, delay);
       };
 
-      socket.onerror = () => socket?.close();
+      socketRef.current.onerror = () => socketRef.current?.close();
     };
 
     connect();
@@ -229,11 +235,19 @@ function useBridge() {
     return () => {
       disposed = true;
       if (retryTimer) clearTimeout(retryTimer);
-      socket?.close();
+      socketRef.current?.close();
     };
   }, []);
 
-  return { status, telemetry, calls, counts };
+  const startRecording = () => {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    setSpeechLog((prev) => armManualRecording(prev));
+    socketRef.current.send(JSON.stringify({ type: "start_recording" }));
+  };
+
+  return { status, telemetry, calls, counts, speechLog, startRecording };
 }
 
 function formatClock(timestamp: number) {
@@ -281,7 +295,7 @@ function PointerCursor({
 }
 
 export default function SurgicalDashboard() {
-  const { status, telemetry, calls, counts } = useBridge();
+  const { status, telemetry, calls, counts, speechLog, startRecording } = useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
   const [scale, setScale] = useState(MIN_ZOOM);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
@@ -389,6 +403,9 @@ export default function SurgicalDashboard() {
 
   return (
     <div className="relative flex h-dvh flex-col overflow-hidden bg-[#05070d] text-slate-200">
+      {speechLog.recording && (
+        <div data-recording-frame aria-hidden className={recordingFrameClass(true) ?? undefined} />
+      )}
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 bg-[#070b14]/95 px-4 py-3 sm:px-6">
         <div className="flex items-center gap-3">
           <span className="grid h-9 w-9 place-items-center rounded-lg border border-sky-500/40 bg-sky-500/10">
@@ -571,7 +588,46 @@ export default function SurgicalDashboard() {
             </p>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+            <div
+              data-speech-status={speechLog.recording ? "recording" : "idle"}
+              className="mb-3 rounded-lg border border-slate-800/80 bg-slate-900/40 px-3 py-2"
+            >
+              <div className="flex items-center gap-2 text-[10px] tracking-[0.18em] uppercase text-slate-400">
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    speechLog.recording ? "bg-amber-400" : "bg-slate-600"
+                  }`}
+                />
+                {speechLogStatusLabel(speechLog)}
+              </div>
+              {speechLog.recording && (
+                <p data-speech-live className="mt-1 font-mono text-xs text-sky-300">
+                  {speechLog.liveText || "…"}
+                </p>
+              )}
+               {speechLog.entries.length > 0 && (
+                 <ul className="mt-2 space-y-2">
+                   {speechLog.entries.map((entry, index) => (
+                     <li
+                       key={index}
+                       data-speech-entry
+                       className="rounded-lg border border-slate-800/80 bg-slate-900/40 px-3 py-2"
+                     >
+                       <div className="flex items-baseline justify-between gap-2">
+                         <span className="font-mono text-xs text-sky-300 break-all">
+                           {entry.text}
+                         </span>
+                         <time className="font-mono text-[10px] text-slate-600">
+                           {formatClock(entry.at)}
+                         </time>
+                       </div>
+                     </li>
+                   ))}
+                 </ul>
+               )}
+               <button type="button" data-start-recording disabled={speechLog.recording} onClick={startRecording} className="mt-2 rounded-md border border-slate-700 px-2 py-1 text-[10px] tracking-[0.16em] text-slate-300 uppercase disabled:opacity-40 cursor-pointer transition active:scale-95 active:border-emerald-400">Record</button>
+             </div>
             {calls.length === 0 ? (
               <div className="rounded-lg border border-dashed border-slate-800 px-3 py-6 text-center">
                 <p className="text-xs text-slate-500">No tool calls yet</p>
@@ -603,6 +659,7 @@ export default function SurgicalDashboard() {
               </ul>
             )}
           </div>
+
 
           <div className="border-t border-slate-800/80 px-4 py-3">
             <h2 className="text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase">
