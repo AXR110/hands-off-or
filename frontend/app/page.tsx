@@ -576,7 +576,7 @@ export default function SurgicalDashboard() {
     setFileNotice(
       fromPinch
         ? "Pinch reached Add, but your browser may block the file picker. Click Add or press Ctrl/Cmd+O to choose files."
-        : "Choose image files to add them to the study list.",
+        : "Choose image files to add them to the image list.",
     );
     fileInputRef.current?.click();
   }, []);
@@ -799,14 +799,9 @@ export default function SurgicalDashboard() {
             alt=""
             className="h-12 w-12 shrink-0 object-contain mix-blend-screen"
           />
-          <div>
-            <h1 className="text-xs font-semibold tracking-[0.2em] text-slate-100 uppercase sm:text-sm">
-              Hands-Off OR
-            </h1>
-            <p className="text-[10px] tracking-[0.18em] text-slate-500 uppercase">
-              Sterile interface · telemetry bridge
-            </p>
-          </div>
+          <h1 className="text-2xl font-semibold tracking-[0.14em] text-slate-100 uppercase sm:text-3xl">
+            Hands-Off OR
+          </h1>
         </div>
 
         <div className="flex items-center gap-4">
@@ -874,7 +869,7 @@ export default function SurgicalDashboard() {
         multiple
         className="sr-only"
         tabIndex={-1}
-        aria-label="Choose image files to add to the study viewer"
+        aria-label="Choose image files to add to the image viewer"
         onChange={(event) => {
           if (event.currentTarget.files) addFiles(event.currentTarget.files);
           event.currentTarget.value = "";
@@ -884,12 +879,12 @@ export default function SurgicalDashboard() {
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         <main className="flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
           <nav
-            aria-label="Studies"
+            aria-label="Images"
             className="flex shrink-0 gap-2 overflow-x-auto border-b border-slate-800/80 bg-[#070b14] p-3 md:w-44 md:flex-col md:overflow-y-auto md:border-r md:border-b-0"
           >
             <div className="w-full shrink-0 md:space-y-2">
               <h2 className="hidden text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase md:block">
-                Studies
+                Images
               </h2>
               <button
                 type="button"
@@ -949,7 +944,7 @@ export default function SurgicalDashboard() {
             <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-slate-800/70 px-4 py-2.5">
               <div className="flex items-center gap-2 text-[10px] tracking-[0.22em] text-slate-500 uppercase">
                 <span className="h-1.5 w-1.5 rounded-full bg-sky-500" />
-                {study.label} study
+                {study.label} image
               </div>
               <span className="text-right">
                 <span className="block font-mono text-[10px] tracking-wider text-slate-400">
@@ -1011,7 +1006,7 @@ export default function SurgicalDashboard() {
             <div className="border-t border-slate-800/70 px-4 py-3">
               <p className="text-[10px] text-slate-500" aria-live="polite">
                 {fileNotice ||
-                  "Drop image files here, use Add to browse, or pinch a study thumbnail."}
+                  "Drop image files here, use Add to browse, or pinch an image thumbnail."}
               </p>
             </div>
           </section>
