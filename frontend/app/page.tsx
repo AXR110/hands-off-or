@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import ImageViewer from "../components/ImageViewer";
 import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, speechLogChronologicalNumber, removeSpeechLogEntry, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
+import { formatOperationDuration, idleOperationTimer, operationElapsedMs, OperationTimer, startOperationTimer, stopOperationTimer } from "./operation-timer";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 
@@ -236,6 +237,12 @@ function recordAtPoint(x: number, y: number) {
 
 function deleteLogAtPoint(x: number, y: number): HTMLButtonElement | null {
   return buttonAtPoint("[data-delete-log]", x, y);
+}
+
+function stopOperationAtPoint(x: number, y: number): HTMLButtonElement | null {
+  const button = buttonAtPoint("[data-stop-operation]", x, y);
+  if (!button || button.disabled) return null;
+  return button;
 }
 
 function deleteLogHoverId(x: number, y: number): string | null {
@@ -659,6 +666,8 @@ export default function SurgicalDashboard() {
   const [hovered, setHovered] = useState<StudyId | null>(null);
   const [drawToolbarTarget, setDrawToolbarTarget] = useState<HTMLDivElement | null>(null);
   const [awake, setAwake] = useState(false);
+  const [operationTimer, setOperationTimer] = useState<OperationTimer>(idleOperationTimer());
+  const [operationNow, setOperationNow] = useState(0);
   const [wakeProgress, setWakeProgress] = useState(0);
   const [wakePulse, setWakePulse] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -974,7 +983,28 @@ export default function SurgicalDashboard() {
     advanceStudy(direction);
   };
 
+  const operationRunning = operationTimer.startedAt != null && operationTimer.stoppedAt == null;
+  const operationElapsed = formatOperationDuration(operationElapsedMs(operationTimer, operationNow));
+  const stopOperation = () => {
+    const now = Date.now();
+    setOperationNow(now);
+    setOperationTimer((current) => stopOperationTimer(current, now));
+  };
+
+  useEffect(() => {
+    if (!operationRunning) return;
+    const tick = () => setOperationNow(Date.now());
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [operationRunning]);
+
   const onPinchDown = (x: number, y: number, mark: { current: PinchMark | null }) => {
+    const stopButton = stopOperationAtPoint(x, y);
+    if (stopButton) {
+      stopButton.click();
+      return;
+    }
     const deleteButton = deleteLogAtPoint(x, y);
     if (deleteButton) {
       deleteButton.click();
@@ -1025,6 +1055,8 @@ export default function SurgicalDashboard() {
           awakeRef.current = true;
           wakeReleaseRequired.current = true;
           setAwake(true);
+          setOperationTimer((current) => startOperationTimer(current, Date.now()));
+          setOperationNow(Date.now());
           setWakeProgress(0);
           setWakePulse(true);
           wake.startedAt = null;
@@ -1154,6 +1186,11 @@ export default function SurgicalDashboard() {
       swipeGesture.current = null;
       if (!both) {
         const pinchControl = (x: number, y: number) => {
+          const stopButton = stopOperationAtPoint(x, y);
+          if (stopButton) {
+            stopButton.click();
+            return;
+          }
           const deleteButton = deleteLogAtPoint(x, y);
           if (deleteButton) {
             deleteButton.click();
@@ -1251,6 +1288,7 @@ export default function SurgicalDashboard() {
     };
 
     const controlHover = (x: number, y: number) =>
+      (stopOperationAtPoint(x, y) ? "stop-operation" : null) ??
       deleteLogHoverId(x, y) ??
       (fileAddAtPoint(x, y)
         ? "add-files"
@@ -1340,6 +1378,27 @@ export default function SurgicalDashboard() {
             </span>
             {status === "online" ? "Bridge online" : status === "connecting" ? "Connecting" : "Reconnecting"}
           </span>
+          <div className="flex items-center gap-2" data-operation-timer>
+            <span
+              data-operation-elapsed
+              className="font-mono text-sm tabular-nums tracking-wide text-slate-100"
+            >
+              {operationElapsed}
+            </span>
+            <button
+              type="button"
+              data-stop-operation
+              disabled={!operationRunning}
+              onClick={stopOperation}
+              className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold tracking-[0.14em] uppercase transition disabled:cursor-default disabled:opacity-40 ${
+                hovered === "stop-operation"
+                  ? "border-red-400 bg-red-500/20 text-red-300"
+                  : "border-slate-600 text-slate-400 enabled:hover:border-red-400 enabled:hover:text-red-300"
+              }`}
+            >
+              Stop operation
+            </button>
+          </div>
           <span
             role="status"
             aria-live="polite"
