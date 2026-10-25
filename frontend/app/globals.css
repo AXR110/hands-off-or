@@ -24,7 +24,7 @@ body {
   background: rgba(56, 189, 248, 0.3);
 }
 
-/* Faint blue grid behind the study viewport. */
+/* Faint blue grid behind the image viewport. */
 .scan-grid {
   background-image:
     linear-gradient(to right, rgba(56, 189, 248, 0.07) 1px, transparent 1px),

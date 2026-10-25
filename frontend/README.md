@@ -18,7 +18,7 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to see the
 
 ## Adding images
 
-Use **Add images** to choose one or more PNG, JPEG, WebP, GIF, or BMP files, or drag image files onto the viewer. Imported images are kept locally in the current page session. Click or pinch a study thumbnail to display it; use the mouse or `Ctrl+O` / `Cmd+O` to open the file picker. Some browsers require a physical click to open the system file picker, so use the mouse or keyboard shortcut if pinching **Add** does not open it.
+Use **Add images** to choose one or more PNG, JPEG, WebP, GIF, or BMP files, or drag image files onto the viewer. Imported images are kept locally in the current page session. Click or pinch an image thumbnail to display it; use the mouse or `Ctrl+O` / `Cmd+O` to open the file picker. Some browsers require a physical click to open the system file picker, so use the mouse or keyboard shortcut if pinching **Add** does not open it.
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
