@@ -13,7 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Touchless Surgical Assistant",
+  title: "Hands-Off OR",
+  applicationName: "Hands-Off OR",
   description: "Sterile, touchless dashboard for pointer telemetry and Gemini tool calls.",
 };
 
