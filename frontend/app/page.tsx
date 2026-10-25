@@ -1,12 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
 const LOG_LIMIT = 50;
-const KNOWN_TOOLS = ["set_pointer", "set_pinch", "log_instrument", "verify_tray_count"];
 const HAND_DETECTION_TIMEOUT_MS = 500;
 const VOICE_STATUS_TIMEOUT_MS = 3000;
 // Hue eases across this band instead of flipping at a hard edge.
@@ -173,8 +172,33 @@ function studyAtPoint(x: number, y: number): StudyId | null {
 }
 
 function fileAddAtPoint(x: number, y: number) {
-  const element = document.elementFromPoint(x * window.innerWidth, y * window.innerHeight);
-  return element?.closest("[data-file-add]") != null;
+  return buttonAtPoint("[data-file-add]", x, y) != null;
+}
+
+function recordAtPoint(x: number, y: number) {
+  return buttonAtPoint("[data-start-recording]", x, y) != null;
+}
+
+// A pinch is a click when the pointer is on the control, with a little slack for aim.
+function buttonAtPoint(selector: string, x: number, y: number): HTMLButtonElement | null {
+  const px = x * window.innerWidth;
+  const py = y * window.innerHeight;
+  const direct = document.elementFromPoint(px, py)?.closest(selector);
+  if (direct instanceof HTMLButtonElement) return direct;
+  const pad = 16;
+  for (const node of document.querySelectorAll(selector)) {
+    if (!(node instanceof HTMLButtonElement)) continue;
+    const rect = node.getBoundingClientRect();
+    if (
+      px >= rect.left - pad &&
+      px <= rect.right + pad &&
+      py >= rect.top - pad &&
+      py <= rect.bottom + pad
+    ) {
+      return node;
+    }
+  }
+  return null;
 }
 
 function isSupportedImage(file: File) {
@@ -483,8 +507,7 @@ function PointerCursor({
 }
 
 export default function SurgicalDashboard() {
-  const { status, telemetry, handDetected, calls, counts, speechLog, voiceLive, startRecording } =
-    useBridge();
+  const { status, telemetry, handDetected, speechLog, voiceLive, startRecording } = useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
   const [uploadedStudies, setUploadedStudies] = useState<Study[]>([]);
   const [fileNotice, setFileNotice] = useState("");
@@ -511,15 +534,6 @@ export default function SurgicalDashboard() {
   const studies: Study[] = [...STUDIES, ...uploadedStudies];
   const studiesRef = useRef<Study[]>([...STUDIES]);
 
-  const toolNames = useMemo(() => {
-    const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
-    return [...KNOWN_TOOLS, ...observed];
-  }, [counts]);
-  const totalCalls = useMemo(
-    () => Object.values(counts).reduce((sum, value) => sum + value, 0),
-    [counts],
-  );
-  const maxCount = Math.max(1, ...toolNames.map((name) => counts[name] ?? 0));
   const pinchActive = telemetry?.pinch_active ?? false;
   const secondHand =
     telemetry != null &&
@@ -722,8 +736,10 @@ export default function SurgicalDashboard() {
     const isDouble =
       prior != null && now - prior.at <= DOUBLE_PINCH_MS && moved <= DOUBLE_PINCH_SLOP_PX;
     if (isDouble && zoomFullyAt(x, y)) return;
-    if (fileAddAtPoint(x, y)) {
-      openFilePicker(true);
+    const pinchedControl =
+      buttonAtPoint("[data-file-add]", x, y) ?? buttonAtPoint("[data-start-recording]", x, y);
+    if (pinchedControl) {
+      pinchedControl.click();
       return;
     }
     focusStudy(studyAtPoint(x, y));
@@ -834,12 +850,12 @@ export default function SurgicalDashboard() {
       secondary: Boolean(second && pinch2),
     };
 
+    const controlHover = (x: number, y: number) =>
+      fileAddAtPoint(x, y) ? "add-files" : recordAtPoint(x, y) ? "record" : null;
     const nextHover =
+      controlHover(telemetry.x, telemetry.y) ??
       studyAtPoint(telemetry.x, telemetry.y) ??
-      (fileAddAtPoint(telemetry.x, telemetry.y) ? "add-files" : null) ??
-      (second
-        ? (studyAtPoint(x2, y2) ?? (fileAddAtPoint(x2, y2) ? "add-files" : null))
-        : null);
+      (second ? (controlHover(x2, y2) ?? studyAtPoint(x2, y2)) : null);
     setHovered((current) => (current === nextHover ? current : nextHover));
   }, [telemetry]);
 
@@ -1069,18 +1085,10 @@ export default function SurgicalDashboard() {
         </main>
 
         <aside className="flex min-h-0 w-full shrink-0 flex-col border-t border-slate-800/80 bg-[#070b14] md:w-[360px] md:border-t-0 md:border-l">
-          <div className="border-b border-slate-800/80 px-4 py-3">
-            <div className="flex items-center justify-between">
-              <h2 className="text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase">
-                Surgical log
-              </h2>
-              <span className="font-mono text-[10px] text-slate-600">
-                {totalCalls} {totalCalls === 1 ? "call" : "calls"}
-              </span>
-            </div>
-            <p className="mt-1 text-[10px] tracking-wider text-slate-600 uppercase">
-              Gemini function calls, newest first
-            </p>
+          <div className="border-b border-slate-800/80 px-4 py-4">
+            <h2 className="text-2xl font-semibold tracking-[0.14em] text-slate-100 uppercase sm:text-3xl">
+              Surgical log
+            </h2>
           </div>
 
            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
@@ -1137,75 +1145,19 @@ export default function SurgicalDashboard() {
                  data-start-recording
                  disabled={speechLog.recording}
                  onClick={startRecording}
-                 className="mt-3 flex min-h-14 w-full items-center justify-center rounded-xl border border-emerald-400/50 bg-emerald-500/15 px-4 py-3 text-base font-semibold tracking-[0.22em] text-emerald-100 uppercase shadow-[0_0_28px_rgba(16,185,129,0.18)] disabled:cursor-default disabled:opacity-40 cursor-pointer transition hover:bg-emerald-500/25 active:scale-[0.98]"
+                 className={`mt-3 flex min-h-14 w-full items-center justify-center rounded-xl border px-4 py-3 text-base font-semibold tracking-[0.22em] uppercase transition active:scale-[0.98] disabled:cursor-default disabled:opacity-40 ${
+                   hovered === "record" && !speechLog.recording
+                     ? "border-emerald-200 bg-emerald-400 text-slate-950 shadow-[0_0_24px_rgba(16,185,129,0.55)]"
+                     : "border-emerald-400/50 bg-emerald-500/15 text-emerald-100 shadow-[0_0_28px_rgba(16,185,129,0.18)] hover:bg-emerald-500/25"
+                 }`}
                >
                  Record
                </button>
              </div>
-            {calls.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-slate-800 px-3 py-6 text-center">
-                <p className="text-xs text-slate-500">No tool calls yet</p>
-                <p className="mt-1 text-[10px] leading-relaxed text-slate-600">
-                  Instrument logs and pointer calls appear here as the bridge emits them.
-                </p>
-              </div>
-            ) : (
-              <ul className="space-y-2">
-                {calls.map((call) => (
-                  <li
-                    key={call.callId}
-                    className="rounded-lg border border-slate-800/80 bg-slate-900/40 px-3 py-2"
-                  >
-                    <div className="flex items-baseline justify-between gap-2">
-                      <span className="font-mono text-xs text-sky-300">{call.name}</span>
-                      <time className="font-mono text-[10px] text-slate-600">
-                        {formatClock(call.at)}
-                      </time>
-                    </div>
-                    <p className="mt-1 break-all font-mono text-[11px] leading-snug text-slate-500">
-                      {JSON.stringify(call.args)}
-                    </p>
-                    {call.result != null && (
-                      <p className="mt-1 break-all font-mono text-[11px] leading-snug text-slate-300">
-                        {JSON.stringify(call.result)}
-                      </p>
-                    )}
-                    <p className="mt-1 text-[9px] tracking-[0.16em] text-slate-600 uppercase">
-                      {call.origin} · {call.callId.slice(0, 8)}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
 
-
           <div className="border-t border-slate-800/80 px-4 py-3">
-            <h2 className="text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase">
-              Tool count
-            </h2>
-            <ul className="mt-2 space-y-1.5">
-              {toolNames.map((name) => {
-                const count = counts[name] ?? 0;
-                return (
-                  <li key={name} className="flex items-center justify-between gap-3">
-                    <span className="font-mono text-[11px] text-slate-400">{name}</span>
-                    <span className="flex items-center gap-2">
-                      <span className="h-1 w-24 overflow-hidden rounded-full bg-slate-800">
-                        <span
-                          className="block h-full rounded-full bg-sky-500/70 transition-all duration-300"
-                          style={{ width: `${Math.round((count / maxCount) * 100)}%` }}
-                        />
-                      </span>
-                      <span className="w-6 text-right font-mono text-[11px] text-slate-300">
-                        {count}
-                      </span>
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-            <p className="mt-3 flex items-center gap-2 text-[9px] tracking-[0.18em] text-slate-600 uppercase">
+            <p className="flex items-center gap-2 font-mono text-[10px] tracking-wide text-slate-500">
               <span
                 className={`h-1.5 w-1.5 rounded-full ${status === "online" ? "bg-sky-500" : "bg-amber-500"}`}
               />
