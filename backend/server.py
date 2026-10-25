@@ -187,6 +187,22 @@ class FunctionResultFrame(BaseModel):
         return self
 
 
+class SpeechLogFrame(BaseModel):
+    """input -> server: spoken text after the wake word (for the surgical log sidebar)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["speech_log"] = "speech_log"
+    phase: Literal["recording", "final", "idle"]
+    text: str = Field(min_length=0, max_length=500)
+
+    @model_validator(mode="after")
+    def _final_requires_text(self) -> SpeechLogFrame:
+        if self.phase == "final" and not self.text.strip():
+            raise ValueError("final speech_log requires text")
+        return self
+
+
 # --- connections -----------------------------------------------------------
 
 
@@ -490,6 +506,22 @@ async def handle_function_result(client: Client, frame: FunctionResultFrame) -> 
         await bridge.broadcast(result, exclude=client.id)
 
 
+async def handle_speech_log(client: Client, frame: SpeechLogFrame) -> None:
+    if client.role != "input":
+        await send_protocol_error(
+            client, "forbidden_role", "speech_log is only accepted from an input client"
+        )
+        return
+    event = {
+        "type": "speech_log",
+        "phase": frame.phase,
+        "text": frame.text,
+        "source": client.id,
+        "server_ts": _now_ms(),
+    }
+    await bridge.broadcast(event, exclude=client.id)
+
+
 async def handle_text(client: Client, raw: str) -> None:
     try:
         payload = json.loads(raw)
@@ -511,6 +543,15 @@ async def handle_text(client: Client, raw: str) -> None:
             await handle_function_result(client, FunctionResultFrame.model_validate(payload))
         elif kind == "video_frame":
             await handle_video_frame(client, VideoFrame.model_validate(payload))
+        elif kind == "speech_log":
+            await handle_speech_log(client, SpeechLogFrame.model_validate(payload))
+        elif kind == "start_recording":
+            if client.role == "viewer":
+                await bridge.broadcast({"type": "start_recording"}, exclude=client.id, roles={"input"})
+                return
+            else:
+                await send_protocol_error(client, "forbidden_role", "start_recording is only accepted from a viewer client")
+                return
         else:
             await send_protocol_error(client, "unknown_type", f"unsupported frame type {kind!r}")
     except ValidationError as exc:
