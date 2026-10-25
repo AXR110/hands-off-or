@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
 
@@ -20,7 +20,13 @@ const STUDIES = [
   { id: "teeth", label: "Teeth", detail: "Dental", src: "/studies/teeth.png" },
 ] as const;
 
-type StudyId = (typeof STUDIES)[number]["id"];
+type StudyId = string;
+type Study = {
+  id: StudyId;
+  label: string;
+  detail: string;
+  src: string;
+};
 
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 4;
@@ -35,6 +41,16 @@ const SWIPE_MIN_SPEED = 0.45;
 const SWIPE_AXIS_RATIO = 1.5;
 // One film per flick. Pinch tracking can drop for a frame mid-swipe; wait until it stays open.
 const SWIPE_RELEASE_MS = 320;
+const SUPPORTED_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/bmp",
+]);
+const SUPPORTED_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp", "gif", "bmp"]);
+const IMAGE_FILE_ACCEPT =
+  ".png,.jpg,.jpeg,.webp,.gif,.bmp,image/png,image/jpeg,image/webp,image/gif,image/bmp";
 
 type Point = { x: number; y: number };
 
@@ -152,8 +168,20 @@ function zoomAtFocal(
 function studyAtPoint(x: number, y: number): StudyId | null {
   const element = document.elementFromPoint(x * window.innerWidth, y * window.innerHeight);
   const id = element?.closest("[data-study]")?.getAttribute("data-study");
-  if (id === "chest" || id === "hand" || id === "teeth") return id;
-  return null;
+  return id ?? null;
+}
+
+function fileAddAtPoint(x: number, y: number) {
+  const element = document.elementFromPoint(x * window.innerWidth, y * window.innerHeight);
+  return element?.closest("[data-file-add]") != null;
+}
+
+function isSupportedImage(file: File) {
+  const extension = file.name.split(".").pop()?.toLowerCase();
+  return (
+    SUPPORTED_IMAGE_TYPES.has(file.type) ||
+    (extension != null && SUPPORTED_IMAGE_EXTENSIONS.has(extension))
+  );
 }
 
 function pointerOverStage(x: number, y: number, stage: DOMRect | undefined) {
@@ -419,9 +447,14 @@ function PointerCursor({
 export default function SurgicalDashboard() {
   const { status, telemetry, handDetected, calls, counts, speechLog, startRecording } = useBridge();
   const [selected, setSelected] = useState<StudyId>("chest");
+  const [uploadedStudies, setUploadedStudies] = useState<Study[]>([]);
+  const [fileNotice, setFileNotice] = useState("");
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [scale, setScale] = useState(MIN_ZOOM);
   const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
   const [hovered, setHovered] = useState<StudyId | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadedUrls = useRef(new Set<string>());
   const scaleRef = useRef(MIN_ZOOM);
   const panRef = useRef<Point>({ x: 0, y: 0 });
   const zoomGesture = useRef<ZoomGesture | null>(null);
@@ -436,7 +469,8 @@ export default function SurgicalDashboard() {
     fired: boolean;
     idleSince: number | null;
   } | null>(null);
-  selectedRef.current = selected;
+  const studies: Study[] = [...STUDIES, ...uploadedStudies];
+  const studiesRef = useRef<Study[]>([...STUDIES]);
 
   const toolNames = useMemo(() => {
     const observed = Object.keys(counts).filter((name) => !KNOWN_TOOLS.includes(name));
@@ -454,7 +488,7 @@ export default function SurgicalDashboard() {
     typeof telemetry.y2 === "number" &&
     typeof telemetry.pinch2_active === "boolean";
   const secondPinch = Boolean(secondHand && telemetry?.pinch2_active);
-  const study = STUDIES.find((item) => item.id === selected) ?? STUDIES[0];
+  const study = studies.find((item) => item.id === selected) ?? studies[0];
   const zoomPercent = Math.round(scale * 100);
   const pointerPositions: Point[] = telemetry
     ? [
@@ -478,6 +512,7 @@ export default function SurgicalDashboard() {
 
   const focusStudy = (id: StudyId | null) => {
     if (!id) return;
+    selectedRef.current = id;
     setSelected(id);
     zoomGesture.current = null;
     scaleRef.current = MIN_ZOOM;
@@ -540,15 +575,83 @@ export default function SurgicalDashboard() {
 
   const advanceStudy = (direction: -1 | 1) => {
     const current = selectedRef.current;
-    const index = STUDIES.findIndex((item) => item.id === current);
+    const currentStudies = studiesRef.current;
+    const index = currentStudies.findIndex((item) => item.id === current);
     if (index < 0) return;
-    const next = STUDIES[(index + direction + STUDIES.length) % STUDIES.length];
+    const next =
+      currentStudies[(index + direction + currentStudies.length) % currentStudies.length];
     if (!next || next.id === current) return;
-    selectedRef.current = next.id;
     lastPrimaryPinch.current = null;
     lastSecondaryPinch.current = null;
     focusStudy(next.id);
   };
+
+  const openFilePicker = useCallback((fromPinch = false) => {
+    setFileNotice(
+      fromPinch
+        ? "Pinch reached Add, but your browser may block the file picker. Click Add or press Ctrl/Cmd+O to choose files."
+        : "Choose image files to add them to the study list.",
+    );
+    fileInputRef.current?.click();
+  }, []);
+
+  const addFiles = (files: FileList | File[]) => {
+    const selectedFiles = Array.from(files);
+    if (selectedFiles.length === 0) return;
+
+    const imageFiles = selectedFiles.filter(isSupportedImage);
+    const skippedCount = selectedFiles.length - imageFiles.length;
+    const additions = imageFiles.map((file) => {
+      const src = URL.createObjectURL(file);
+      uploadedUrls.current.add(src);
+      return {
+        id: `upload-${crypto.randomUUID()}`,
+        label: file.name.replace(/\.[^.]+$/, "") || file.name,
+        detail: "Imported image",
+        src,
+      };
+    });
+
+    if (additions.length > 0) {
+      studiesRef.current = [...studiesRef.current, ...additions];
+      setUploadedStudies((current) => [...current, ...additions]);
+      focusStudy(additions[0].id);
+    }
+
+    setFileNotice(
+      additions.length === 0
+        ? "No supported images added. Choose PNG, JPEG, WebP, GIF, or BMP files."
+        : skippedCount > 0
+          ? `Added ${additions.length} image${additions.length === 1 ? "" : "s"}; skipped ${skippedCount} unsupported file${skippedCount === 1 ? "" : "s"}.`
+          : `Added ${additions.length} image${additions.length === 1 ? "" : "s"}. Pinch or click a thumbnail to view it.`,
+    );
+  };
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") {
+        const target = event.target;
+        if (
+          target instanceof HTMLElement &&
+          (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
+        ) {
+          return;
+        }
+        event.preventDefault();
+        openFilePicker();
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [openFilePicker]);
+
+  useEffect(
+    () => () => {
+      for (const url of uploadedUrls.current) URL.revokeObjectURL(url);
+      uploadedUrls.current.clear();
+    },
+    [],
+  );
 
   const appendSwipe = (x: number, y: number) => {
     const gesture = swipeGesture.current;
@@ -580,6 +683,10 @@ export default function SurgicalDashboard() {
     const isDouble =
       prior != null && now - prior.at <= DOUBLE_PINCH_MS && moved <= DOUBLE_PINCH_SLOP_PX;
     if (isDouble && zoomFullyAt(x, y)) return;
+    if (fileAddAtPoint(x, y)) {
+      openFilePicker(true);
+      return;
+    }
     focusStudy(studyAtPoint(x, y));
   };
 
@@ -689,7 +796,11 @@ export default function SurgicalDashboard() {
     };
 
     const nextHover =
-      studyAtPoint(telemetry.x, telemetry.y) ?? (second ? studyAtPoint(x2, y2) : null);
+      studyAtPoint(telemetry.x, telemetry.y) ??
+      (fileAddAtPoint(telemetry.x, telemetry.y) ? "add-files" : null) ??
+      (second
+        ? (studyAtPoint(x2, y2) ?? (fileAddAtPoint(x2, y2) ? "add-files" : null))
+        : null);
     setHovered((current) => (current === nextHover ? current : nextHover));
   }, [telemetry]);
 
@@ -713,7 +824,7 @@ export default function SurgicalDashboard() {
           </span>
           <div>
             <h1 className="text-xs font-semibold tracking-[0.2em] text-slate-100 uppercase sm:text-sm">
-              Touchless Surgical Assistant
+              Hands-Off OR
             </h1>
             <p className="text-[10px] tracking-[0.18em] text-slate-500 uppercase">
               Sterile interface · telemetry bridge
@@ -779,21 +890,50 @@ export default function SurgicalDashboard() {
         </div>
       </header>
 
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept={IMAGE_FILE_ACCEPT}
+        multiple
+        className="sr-only"
+        tabIndex={-1}
+        aria-label="Choose image files to add to the study viewer"
+        onChange={(event) => {
+          if (event.currentTarget.files) addFiles(event.currentTarget.files);
+          event.currentTarget.value = "";
+        }}
+      />
+
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         <main className="flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
           <nav
             aria-label="Studies"
             className="flex shrink-0 gap-2 overflow-x-auto border-b border-slate-800/80 bg-[#070b14] p-3 md:w-44 md:flex-col md:overflow-y-auto md:border-r md:border-b-0"
           >
-            <div className="hidden shrink-0 md:block">
-              <h2 className="text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase">
+            <div className="w-full shrink-0 md:space-y-2">
+              <h2 className="hidden text-[10px] font-semibold tracking-[0.22em] text-slate-400 uppercase md:block">
                 Studies
               </h2>
-              <p className="mt-1 text-[10px] leading-relaxed tracking-wider text-slate-600 uppercase">
-                Pinch a film to focus it
+              <button
+                type="button"
+                data-file-add
+                onClick={() => openFilePicker()}
+                className={`min-h-12 min-w-36 rounded-lg border px-4 py-3 text-xs font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 md:w-full ${
+                  hovered === "add-files"
+                    ? "border-sky-200 bg-sky-400 text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.6)] ring-2 ring-sky-300/60"
+                    : "border-sky-500/50 bg-sky-500/10 text-sky-200 hover:border-sky-400 hover:bg-sky-500/20"
+                }`}
+                aria-label="Add image files"
+                title="Add images (Ctrl+O or Cmd+O)"
+                aria-keyshortcuts="Control+O Meta+O"
+              >
+                + Add images
+              </button>
+              <p className="mt-1 hidden text-[10px] leading-relaxed tracking-wider text-slate-600 md:block">
+                Pinch or click a film to view it
               </p>
             </div>
-            {STUDIES.map((item) => {
+            {studies.map((item) => {
               const active = item.id === selected;
               const underCursor = item.id === hovered;
               return (
@@ -846,6 +986,25 @@ export default function SurgicalDashboard() {
 
             <div
               ref={stageRef}
+              onDragOver={(event) => {
+                if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "copy";
+                setIsDraggingFiles(true);
+              }}
+              onDragLeave={(event) => {
+                if (
+                  !(event.relatedTarget instanceof Node) ||
+                  !event.currentTarget.contains(event.relatedTarget)
+                ) {
+                  setIsDraggingFiles(false);
+                }
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                setIsDraggingFiles(false);
+                addFiles(event.dataTransfer.files);
+              }}
               className="scan-grid relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_50%_45%,rgba(14,165,233,0.10),transparent_60%)]"
             >
               <span className="pointer-events-none absolute top-4 left-4 h-6 w-6 border-t-2 border-l-2 border-sky-500/30" />
@@ -856,11 +1015,27 @@ export default function SurgicalDashboard() {
               <img
                 ref={imageRef}
                 src={study.src}
-                alt={`${study.label} X-ray`}
+                alt={`${study.label} image`}
                 draggable={false}
                 className="max-h-full max-w-full origin-center object-contain select-none"
                 style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}
               />
+              {isDraggingFiles && (
+                <div className="pointer-events-none absolute inset-3 z-10 grid place-items-center rounded-xl border-2 border-dashed border-sky-400 bg-sky-950/80 text-center">
+                  <div>
+                    <p className="text-sm font-medium text-sky-200">Drop images to add them</p>
+                    <p className="mt-1 text-xs text-sky-100/70">
+                      PNG, JPG, WebP, GIF, or BMP
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="border-t border-slate-800/70 px-4 py-3">
+              <p className="text-[10px] text-slate-500" aria-live="polite">
+                {fileNotice ||
+                  "Drop image files here, use Add to browse, or pinch a study thumbnail."}
+              </p>
             </div>
           </section>
         </main>

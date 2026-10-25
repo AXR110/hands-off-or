@@ -1,4 +1,4 @@
-# Touchless Surgical Assistant: Product Specification
+# Hands-Off OR: Product Specification
 
 ## 1. Project Pitch & Overview
 * The Problem: Surgeons in under-resourced clinics often lack circulating nurses to help navigate medical records, DICOM viewers, or surgical logs while scrubbed in. 
