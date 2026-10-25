@@ -15,10 +15,26 @@ function parametricStroke(
 
 test("snaps a rough closed circle", () => {
   const roughCircle = parametricStroke(100, (angle) => {
-    const radius = 0.2 + 0.004 * Math.sin(angle * 7);
+    const radius = 0.2 + 0.012 * Math.sin(angle * 7) + 0.006 * Math.sin(angle * 13);
     return { x: 0.5 + radius * Math.cos(angle), y: 0.5 + radius * Math.sin(angle) };
   });
   assert.equal(detectCircle(roughCircle)?.type, "circle");
+});
+
+test("snaps an egg-shaped stroke", () => {
+  const egg = parametricStroke(100, (angle) => {
+    const radius = 0.2 + 0.035 * Math.cos(angle);
+    return { x: 0.5 + radius * Math.cos(angle), y: 0.5 + radius * Math.sin(angle) };
+  });
+  assert.equal(detectCircle(egg)?.type, "circle");
+});
+
+test("snaps an almost-closed loop", () => {
+  const loop = Array.from({ length: 100 }, (_, index) => {
+    const angle = ((340 * index) / 99) * (Math.PI / 180);
+    return { x: 0.5 + 0.2 * Math.cos(angle), y: 0.5 + 0.2 * Math.sin(angle) };
+  });
+  assert.equal(detectCircle(loop)?.type, "circle");
 });
 
 test("does not snap an open arc", () => {
