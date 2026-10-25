@@ -6,7 +6,11 @@ const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws
 const LOG_LIMIT = 50;
 const KNOWN_TOOLS = ["set_pointer", "set_pinch"];
 const HAND_DETECTION_TIMEOUT_MS = 500;
-const EDGE_WARNING_THRESHOLD = 0.06;
+// Hue eases across this band instead of flipping at a hard edge.
+const EDGE_BLEND_START = 0.14;
+const EDGE_BLEND_END = 0.025;
+const FRAME_BLUE = { h: 198.44, s: 93.2, l: 59.61, a: 0.3 };
+const FRAME_RED = { h: 360, s: 90.6, l: 70.78, a: 0.42 };
 
 const STUDIES = [
   { id: "chest", label: "Chest", detail: "PA chest", src: "/studies/chest.png" },
@@ -64,6 +68,25 @@ function clamp(value: number, min: number, max: number) {
 
 function clampZoom(scale: number) {
   return clamp(scale, MIN_ZOOM, MAX_ZOOM);
+}
+
+function smoothstep(value: number) {
+  const t = clamp(value, 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+function edgeProximity(x: number, y: number) {
+  const distance = Math.min(x, 1 - x, y, 1 - y);
+  return (EDGE_BLEND_START - distance) / (EDGE_BLEND_START - EDGE_BLEND_END);
+}
+
+function frameTint(amount: number) {
+  const t = smoothstep(amount);
+  const h = FRAME_BLUE.h + (FRAME_RED.h - FRAME_BLUE.h) * t;
+  const s = FRAME_BLUE.s + (FRAME_RED.s - FRAME_BLUE.s) * t;
+  const l = FRAME_BLUE.l + (FRAME_RED.l - FRAME_BLUE.l) * t;
+  const a = FRAME_BLUE.a + (FRAME_RED.a - FRAME_BLUE.a) * t;
+  return `hsla(${h.toFixed(2)}, ${s.toFixed(1)}%, ${l.toFixed(1)}%, ${a.toFixed(3)})`;
 }
 
 // Keep the pinched spot fixed. Only stop the film from sliding fully out of view.
@@ -427,16 +450,11 @@ export default function SurgicalDashboard() {
           : []),
       ]
     : [];
-  const cursorNearEdge =
-    handDetected &&
-    pointerPositions.some(
-      ({ x, y }) =>
-        x <= EDGE_WARNING_THRESHOLD ||
-        x >= 1 - EDGE_WARNING_THRESHOLD ||
-        y <= EDGE_WARNING_THRESHOLD ||
-        y >= 1 - EDGE_WARNING_THRESHOLD,
-    );
-  const frameColor = cursorNearEdge ? "rgba(248, 113, 113, 0.42)" : "rgba(56, 189, 248, 0.3)";
+  const edgeAmount = pointerPositions.reduce(
+    (nearest, point) => Math.max(nearest, edgeProximity(point.x, point.y)),
+    0,
+  );
+  const frameColor = frameTint(edgeAmount);
   const frameMask = [
     "linear-gradient(to right, #000 0%, transparent 72px)",
     "linear-gradient(to left, #000 0%, transparent 72px)",
@@ -926,10 +944,11 @@ export default function SurgicalDashboard() {
       )}
       <div
         aria-hidden
-        className="pointer-events-none fixed inset-0 z-40 transition-opacity duration-500 ease-out"
+        className="pointer-events-none fixed inset-0 z-40"
         style={{
           opacity: handDetected ? 1 : 0,
           background: frameColor,
+          transition: "opacity 500ms ease-out, background-color 450ms ease-in-out",
           maskImage: frameMask,
           WebkitMaskImage: frameMask,
           maskComposite: "add",
