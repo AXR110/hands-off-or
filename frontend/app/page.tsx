@@ -1258,7 +1258,7 @@ export default function SurgicalDashboard() {
             className="h-12 w-12 shrink-0 object-contain mix-blend-screen"
           />
           <h1 className="text-2xl font-semibold tracking-[0.14em] text-slate-100 uppercase sm:text-3xl">
-            Hands-Off OR
+            Hands-Off Operating Room
           </h1>
         </div>
 
