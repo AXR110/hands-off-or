@@ -26,11 +26,9 @@ socket payload stays 16 kHz mono PCM16, which is what Gemini Live consumes.
 from __future__ import annotations
 
 import argparse
-import array
 import asyncio
 import json
 import logging
-import math
 import re
 import sys
 import threading
@@ -86,7 +84,7 @@ COMMAND_WINDOW_S = 6.0
 RECONNECT_DELAY_S = 2.0
 LISTEN_TIMEOUT_S = 1.0
 QUEUE_SIZE = 8
-AUDIO_LEVEL_INTERVAL_S = 0.08
+VOICE_STATUS_INTERVAL_S = 1.0
 # End the phrase sooner than the library default (0.8s) once the voice stops.
 # Keep the whole utterance: a hard clip shorter than the word drops "log".
 # pause_threshold must stay at least non_speaking_duration.
@@ -141,10 +139,6 @@ class VoiceSpeechLog:
         with self._lock:
             return self._session.arm()
 
-    def on_manual_stop(self) -> list[dict[str, str]]:
-        with self._lock:
-            return self._session.stop()
-
 
 def _client_id(server_url: str) -> str:
     query = urllib.parse.parse_qs(urllib.parse.urlparse(server_url).query)
@@ -166,16 +160,12 @@ def _is_disconnect(exc: BaseException) -> bool:
 class _SoundDeviceStream:
     """Bytes reader matching ``speech_recognition``'s ``stream.read(chunk)``."""
 
-    def __init__(self, stream: Any, on_audio_level=None) -> None:
+    def __init__(self, stream: Any) -> None:
         self._stream = stream
-        self._on_audio_level = on_audio_level
 
     def read(self, size: int) -> bytes:
         data, _overflowed = self._stream.read(size)
-        pcm = bytes(data)
-        if self._on_audio_level is not None:
-            self._on_audio_level(_pcm_audio_level(pcm))
-        return pcm
+        return bytes(data)
 
     def close(self) -> None:
         self._stream.stop()
@@ -204,7 +194,6 @@ class SoundDeviceMicrophone(sr.AudioSource):
         self.SAMPLE_WIDTH = SAMPLE_WIDTH
         self.CHUNK = chunk_size
         self.stream: _SoundDeviceStream | None = None
-        self.audio_level = 0.0
 
     def __enter__(self) -> SoundDeviceMicrophone:
         if self.stream is not None:
@@ -217,8 +206,7 @@ class SoundDeviceMicrophone(sr.AudioSource):
             device=self.device_index,
         )
         raw.start()
-        self.audio_level = 0.0
-        self.stream = _SoundDeviceStream(raw, self._set_audio_level)
+        self.stream = _SoundDeviceStream(raw)
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
@@ -226,21 +214,6 @@ class SoundDeviceMicrophone(sr.AudioSource):
         self.stream = None
         if stream is not None:
             stream.close()
-
-    def _set_audio_level(self, level: float) -> None:
-        self.audio_level = level
-
-
-def _pcm_audio_level(pcm: bytes) -> float:
-    usable_length = len(pcm) - len(pcm) % SAMPLE_WIDTH
-    if usable_length == 0:
-        return 0.0
-    samples = array.array("h")
-    samples.frombytes(pcm[:usable_length])
-    if sys.byteorder != "little":
-        samples.byteswap()
-    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
-    return min(1.0, rms / 3000)
 
 
 def list_input_devices() -> list[tuple[int, str]]:
@@ -422,15 +395,6 @@ class WakeListener:
         self._arm()
         self._enqueue_logs(self._speech_log.on_manual_start())
         LOG.info("record button pressed; capturing the next phrase")
-
-    @property
-    def audio_level(self) -> float:
-        return float(getattr(self._microphone, "audio_level", 0.0))
-
-    def stop_manual_recording(self) -> None:
-        self._command_deadline = None
-        self._enqueue_logs(self._speech_log.on_manual_stop())
-        LOG.info("record button released; stopped capturing the surgical log")
 
     def _loop_listen(self) -> None:
         try:
@@ -624,12 +588,7 @@ async def _handle_function_call(websocket: Any, payload: dict[str, Any], client_
     await websocket.send(json.dumps(frame))
 
 
-async def receive_frames(
-    websocket: Any,
-    client_id: str,
-    on_start_recording=None,
-    on_stop_recording=None,
-) -> None:
+async def receive_frames(websocket: Any, client_id: str, on_start_recording=None) -> None:
     """Execute surgical tool calls the bridge relays from Gemini."""
     async for message in websocket:
         if not isinstance(message, str):
@@ -644,9 +603,6 @@ async def receive_frames(
         if kind == "start_recording":
             if on_start_recording is not None:
                 on_start_recording()
-        elif kind == "stop_recording":
-            if on_stop_recording is not None:
-                on_stop_recording()
         elif kind == "error":
             LOG.warning(
                 "server rejected a frame: %s (%s)", payload.get("code"), payload.get("message")
@@ -673,16 +629,8 @@ async def send_voice_status(websocket: Any, listener: WakeListener) -> None:
     """Tell viewers the microphone is open. Silence means voice is off."""
     while True:
         if listener.mic_open:
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "voice_status",
-                        "active": True,
-                        "level": listener.audio_level,
-                    }
-                )
-            )
-        await asyncio.sleep(AUDIO_LEVEL_INTERVAL_S)
+            await websocket.send(json.dumps({"type": "voice_status", "active": True}))
+        await asyncio.sleep(VOICE_STATUS_INTERVAL_S)
 
 
 async def send_speech_logs(websocket: Any, queue: asyncio.Queue[dict[str, str]]) -> None:
@@ -699,13 +647,9 @@ async def session(
     log_queue: asyncio.Queue[dict[str, str]],
     listener: WakeListener,
     on_start_recording=None,
-    on_stop_recording=None,
 ) -> None:
     async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(
-            receive_frames(websocket, client_id, on_start_recording, on_stop_recording),
-            name="voice-receive",
-        )
+        tasks.create_task(receive_frames(websocket, client_id, on_start_recording), name="voice-receive")
         tasks.create_task(send_audio(websocket, queue), name="voice-send")
         tasks.create_task(send_speech_logs(websocket, log_queue), name="voice-speech-log")
         tasks.create_task(send_voice_status(websocket, listener), name="voice-status")
@@ -759,7 +703,6 @@ async def run(args: argparse.Namespace) -> None:
                             log_queue,
                             listener,
                             listener.arm_from_button,
-                            listener.stop_manual_recording,
                         )
                     except BaseExceptionGroup as exc:
                         if not _is_disconnect(exc):

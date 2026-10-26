@@ -11,14 +11,6 @@ class TestAudioBackend(unittest.TestCase):
         self.assertEqual(mic.SAMPLE_WIDTH, 2)
         self.assertIsNone(mic.stream)
 
-    def test_pcm_audio_level_tracks_input_amplitude(self):
-        self.assertEqual(voice._pcm_audio_level(b"\x00\x00" * 8), 0.0)
-        quiet = voice._pcm_audio_level(b"\xe8\x03" * 8)
-        loud = voice._pcm_audio_level(b"\x70\x17" * 8)
-        self.assertGreater(quiet, 0)
-        self.assertGreater(loud, quiet)
-        self.assertLessEqual(voice._pcm_audio_level(b"\xff\x7f" * 8), 1.0)
-
     def test_selects_macbook_microphone_ahead_of_iphone(self):
         names = [
             "iPhone Microphone",

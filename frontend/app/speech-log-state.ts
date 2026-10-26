@@ -80,8 +80,3 @@ export function armManualRecording(view: SpeechLogView): SpeechLogView {
   if (view.recording) return view;
   return applySpeechLog(view, { type: "speech_log", phase: "recording", text: "" });
 }
-
-export function stopManualRecording(view: SpeechLogView): SpeechLogView {
-  if (!view.recording) return view;
-  return { ...view, recording: false, liveText: "" };
-}

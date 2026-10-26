@@ -6,7 +6,6 @@ import {
   speechLogStatusLabel,
   speechLogChronologicalNumber,
   removeSpeechLogEntry,
-  stopManualRecording,
   SPEECH_LOG_LIMIT,
 } from "../app/speech-log-state.ts";
 
@@ -23,25 +22,6 @@ test("apply recording empty text", () => {
   assert.strictEqual(view.liveText, "");
   assert.strictEqual(view.entries.length, 0);
   assert.strictEqual(speechLogStatusLabel(view), "Recording");
-});
-
-test("stopManualRecording ends capture while retaining saved entries", () => {
-  const initial = applySpeechLog(emptySpeechLog(), {
-    type: "speech_log",
-    phase: "final",
-    text: "add sponge",
-    server_ts: 1,
-  });
-  const recording = applySpeechLog(initial, {
-    type: "speech_log",
-    phase: "recording",
-    text: "next item",
-  });
-  const stopped = stopManualRecording(recording);
-  assert.strictEqual(stopped.recording, false);
-  assert.strictEqual(stopped.liveText, "");
-  assert.deepStrictEqual(stopped.entries, recording.entries);
-  assert.strictEqual(stopManualRecording(initial), initial);
 });
 
 test("apply recording with text", () => {

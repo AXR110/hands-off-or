@@ -25,20 +25,5 @@ class TestManualRecord(unittest.TestCase):
         events = session.arm()
         self.assertTrue(all(e.get("phase") != "final" for e in events))
 
-    def test_stop_finishes_the_current_log(self):
-        session = SpeechLogSession()
-        session.arm()
-        session.hear("add sponge")
-        events = session.stop()
-        self.assertEqual(
-            events,
-            [
-                {"type": "speech_log", "phase": "final", "text": "add sponge"},
-                {"type": "speech_log", "phase": "idle", "text": ""},
-            ],
-        )
-        self.assertEqual(session.phase, "idle")
-        self.assertEqual(session.stop(), [])
-
 if __name__ == "__main__":
     unittest.main()
