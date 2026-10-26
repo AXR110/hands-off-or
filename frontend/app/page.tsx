@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import ImageViewer from "../components/ImageViewer";
-import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, speechLogChronologicalNumber, removeSpeechLogEntry, SpeechLogView, recordingFrameClass, armManualRecording } from "./speech-log-state";
+import { emptySpeechLog, applySpeechLog, speechLogStatusLabel, speechLogChronologicalNumber, removeSpeechLogEntry, SpeechLogView, recordingFrameClass, armManualRecording, stopManualRecording } from "./speech-log-state";
 import { formatOperationDuration, idleOperationTimer, operationElapsedMs, OperationTimer, startOperationTimer, stopOperationTimer } from "./operation-timer";
 
 const BRIDGE_URL = process.env.NEXT_PUBLIC_BRIDGE_URL ?? "ws://localhost:8000/ws";
@@ -419,6 +419,7 @@ function useBridge() {
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [speechLog, setSpeechLog] = useState<SpeechLogView>(emptySpeechLog());
   const [voiceLive, setVoiceLive] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
   const seenCalls = useRef(new Set<string>());
   const socketRef = useRef<WebSocket | null>(null);
   const pickedImagesHandler = useRef<(frame: PickedImagesFrame) => void>(() => {});
@@ -499,10 +500,18 @@ function useBridge() {
           voiceStatusTimer = null;
           if (!active) {
             setVoiceLive(false);
+            setAudioLevel(0);
           } else {
             setVoiceLive(true);
+            const level = (frame as { level?: unknown }).level;
+            setAudioLevel(
+              typeof level === "number" && Number.isFinite(level)
+                ? clamp(level, 0, 1)
+                : 0,
+            );
             voiceStatusTimer = setTimeout(() => {
               setVoiceLive(false);
+              setAudioLevel(0);
               voiceStatusTimer = null;
             }, VOICE_STATUS_TIMEOUT_MS);
           }
@@ -555,6 +564,22 @@ function useBridge() {
     socketRef.current.send(JSON.stringify({ type: "start_recording" }));
   };
 
+  const stopRecording = () => {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    setSpeechLog((prev) => stopManualRecording(prev));
+    socketRef.current.send(JSON.stringify({ type: "stop_recording" }));
+  };
+
+  const toggleRecording = () => {
+    if (speechLog.recording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  };
+
   const removeLogEntry = (index: number) => {
     setSpeechLog((prev) => removeSpeechLogEntry(prev, index));
   };
@@ -575,7 +600,8 @@ function useBridge() {
     counts,
     speechLog,
     voiceLive,
-    startRecording,
+    audioLevel,
+    toggleRecording,
     removeLogEntry,
     requestImagePick,
     pickedImagesHandler,
@@ -650,7 +676,8 @@ export default function SurgicalDashboard() {
     handDetected,
     speechLog,
     voiceLive,
-    startRecording,
+    audioLevel,
+    toggleRecording,
     removeLogEntry,
     requestImagePick,
     pickedImagesHandler,
@@ -1687,15 +1714,17 @@ export default function SurgicalDashboard() {
                <button
                  type="button"
                  data-start-recording
-                 disabled={speechLog.recording}
-                 onClick={startRecording}
-                 className={`mt-3 flex min-h-14 w-full items-center justify-center rounded-xl border px-4 py-3 text-base font-semibold tracking-[0.22em] uppercase transition active:scale-[0.98] disabled:cursor-default disabled:opacity-40 ${
-                   hovered === "record" && !speechLog.recording
-                     ? "border-emerald-200 bg-emerald-400 text-slate-950 shadow-[0_0_24px_rgba(16,185,129,0.55)]"
-                     : "border-emerald-400/50 bg-emerald-500/15 text-emerald-100 shadow-[0_0_28px_rgba(16,185,129,0.18)] hover:bg-emerald-500/25"
+                 aria-pressed={speechLog.recording}
+                 onClick={toggleRecording}
+                 className={`mt-3 flex min-h-14 w-full items-center justify-center rounded-xl border px-4 py-3 text-base font-semibold tracking-[0.22em] uppercase transition active:scale-[0.98] ${
+                   speechLog.recording
+                     ? "border-red-300 bg-red-500/20 text-red-100 shadow-[0_0_28px_rgba(239,68,68,0.32)] hover:bg-red-500/30"
+                     : hovered === "record"
+                       ? "border-emerald-200 bg-emerald-400 text-slate-950 shadow-[0_0_24px_rgba(16,185,129,0.55)]"
+                       : "border-emerald-400/50 bg-emerald-500/15 text-emerald-100 shadow-[0_0_28px_rgba(16,185,129,0.18)] hover:bg-emerald-500/25"
                  }`}
                >
-                 Record
+                 {speechLog.recording ? "Stop" : "Record"}
                </button>
              </div>
           </div>
@@ -1797,15 +1826,21 @@ export default function SurgicalDashboard() {
       <div
         aria-hidden
         data-voice-live={voiceLive ? "on" : "off"}
+        data-audio-level={audioLevel.toFixed(2)}
         data-log-hue={speechLog.recording ? "on" : "off"}
         className={`pointer-events-none fixed inset-0 z-40 ${
           speechLog.recording ? "voice-live-hue" : ""
         }`}
         style={{
-          opacity: speechLog.recording || handDetected ? 1 : 0,
-          background: speechLog.recording ? undefined : frameColor,
+          opacity: speechLog.recording ? 0.16 + audioLevel * 0.84 : handDetected ? 1 : 0,
+          background: speechLog.recording
+            ? `rgba(34, 197, 94, ${(0.14 + audioLevel * 0.58).toFixed(3)})`
+            : frameColor,
+          boxShadow: speechLog.recording
+            ? `inset 0 0 ${36 + audioLevel * 88}px rgba(34, 197, 94, ${(0.08 + audioLevel * 0.38).toFixed(3)})`
+            : undefined,
           transition: speechLog.recording
-            ? "opacity 500ms ease-out"
+            ? "opacity 80ms linear, background-color 80ms linear, box-shadow 80ms linear"
             : "opacity 500ms ease-out, background-color 450ms ease-in-out",
           maskImage: frameMask,
           WebkitMaskImage: frameMask,

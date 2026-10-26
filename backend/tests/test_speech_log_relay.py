@@ -100,14 +100,54 @@ class TestSpeechLogRelay(unittest.TestCase):
             await bridge.add(voice)
             await bridge.add(viewer)
             try:
-                await handle_text(voice, json.dumps({"type": "voice_status", "active": True}))
+                await handle_text(
+                    voice,
+                    json.dumps({"type": "voice_status", "active": True, "level": 0.65}),
+                )
             finally:
                 await bridge.remove("voice-status")
                 await bridge.remove("viewer-status")
             status = [frame for frame in viewer_frames if frame.get("type") == "voice_status"]
             self.assertEqual(len(status), 1, viewer_frames)
             self.assertTrue(status[0]["active"])
+            self.assertEqual(status[0]["level"], 0.65)
             self.assertEqual(status[0]["source"], "voice-status")
+
+        asyncio.run(run_test())
+
+    def test_record_controls_relay_to_input_clients(self):
+        async def run_test():
+            input_frames = []
+            viewer_frames = []
+
+            async def input_send(data):
+                input_frames.append(json.loads(data))
+
+            async def viewer_send(data):
+                viewer_frames.append(json.loads(data))
+
+            class Socket:
+                def __init__(self, send):
+                    self._send = send
+
+                async def send_text(self, data):
+                    await self._send(data)
+
+            input_client = Client("record-input", "input", Socket(input_send), 0)
+            viewer_client = Client("record-viewer", "viewer", Socket(viewer_send), 0)
+            await bridge.add(input_client)
+            await bridge.add(viewer_client)
+            try:
+                for command in ("start_recording", "stop_recording"):
+                    await handle_text(viewer_client, json.dumps({"type": command}))
+                self.assertEqual(
+                    [frame["type"] for frame in input_frames],
+                    ["start_recording", "stop_recording"],
+                )
+                self.assertEqual(viewer_frames, [])
+            finally:
+                await bridge.remove("record-input")
+                await bridge.remove("record-viewer")
 
         asyncio.run(run_test())
 
