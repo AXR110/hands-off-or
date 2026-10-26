@@ -63,19 +63,9 @@ body {
   }
 }
 
-/* Log capture only: green edge while "log" or Record has armed a phrase. */
+/* Log capture edge intensity is driven by the live microphone level. */
 .voice-live-hue {
-  animation: voice-hue-pulse 3.2s ease-in-out infinite;
-}
-
-@keyframes voice-hue-pulse {
-  0%,
-  100% {
-    background: hsla(142, 72%, 45%, 0.28);
-  }
-  50% {
-    background: hsla(142, 72%, 52%, 0.55);
-  }
+  will-change: opacity, background-color, box-shadow;
 }
 
 .voice-live-dot {
@@ -96,11 +86,6 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .voice-live-hue {
-    animation: none;
-    background: hsla(142, 72%, 52%, 0.45);
-  }
-
   .voice-live-dot {
     animation: none;
     opacity: 1;

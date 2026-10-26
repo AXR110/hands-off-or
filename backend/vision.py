@@ -35,6 +35,7 @@ import json
 import logging
 import math
 import shutil
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -49,12 +50,41 @@ from mediapipe.tasks.python import vision as mp_vision
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
+from hand_lock import (
+    ARM_REACH_RATIO,
+    DEBUG_HANDS,
+    LOST_GRACE_FRAMES,
+    POSE_FPS,
+    POSE_INPUT_WIDTH,
+    POSE_MAX_AGE_MS,
+    SIZE_MAX_RATIO,
+    SIZE_MIN_RATIO,
+    SWITCH_COOLDOWN_S,
+    SWITCH_FRAMES,
+    WRIST_MATCH_DISTANCE,
+    SWITCH_HOLD_S,
+    HandCandidate,
+    HandProfile,
+    PoseProfile,
+    choose_main_hand,
+    decide_hand,
+    distance_px,
+    lenient_hand_check,
+    link_operator_pose,
+    match_operator_pose,
+)
+
 LOG = logging.getLogger("vision")
 
 DEFAULT_MODEL = Path(__file__).with_name("models") / "hand_landmarker.task"
+POSE_MODEL = Path(__file__).with_name("models") / "pose_landmarker_lite.task"
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/1/hand_landmarker.task"
+)
+POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 )
 
 # Hand landmark indices (https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker).
@@ -62,6 +92,14 @@ WRIST = 0
 THUMB_TIP = 4
 INDEX_TIP = 8
 MIDDLE_FINGER_MCP = 9
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+LEFT_WRIST = 15
+RIGHT_WRIST = 16
+POSE_CONFIDENCE = 0.5
+WAKE_HOLD_SECONDS = 1.5
+WAKE_MISSED_FRAME_TOLERANCE = 5
+NO_HAND_SLEEP_SECONDS = 10.5
 
 RECONNECT_DELAY_S = 2.0
 MAX_READ_FAILURES = 60  # consecutive dropped reads before giving up (~2 s at camera rate)
@@ -108,7 +146,7 @@ class HandTracker:
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
             running_mode=mp_vision.RunningMode.VIDEO,
-            num_hands=2,
+            num_hands=3,
             min_hand_detection_confidence=min_detection_confidence,
             min_hand_presence_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
@@ -127,6 +165,129 @@ class HandTracker:
 
     def close(self) -> None:
         self._landmarker.close()
+
+
+@dataclass(frozen=True)
+class PoseFrame:
+    poses: tuple[PoseProfile, ...]
+    captured_at: float
+    frame_shape: tuple[int, int]
+
+
+def _pose_profiles(result: Any, frame_shape: Sequence[int]) -> tuple[PoseProfile, ...]:
+    width = frame_shape[1]
+    profiles: list[PoseProfile] = []
+    for landmarks in result.pose_landmarks:
+        selected = [
+            landmarks[index]
+            for index in (LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST)
+        ]
+        confidence = min(
+            min(float(getattr(point, "visibility", 1.0)), float(getattr(point, "presence", 1.0)))
+            for point in selected
+        )
+        if confidence < POSE_CONFIDENCE:
+            continue
+        left_shoulder, right_shoulder, left_wrist, right_wrist = selected
+        shoulder_width = abs(float(left_shoulder.x) - float(right_shoulder.x)) * width
+        if shoulder_width <= 1e-6:
+            continue
+        profiles.append(
+            PoseProfile(
+                left_wrist=(float(left_wrist.x), float(left_wrist.y)),
+                right_wrist=(float(right_wrist.x), float(right_wrist.y)),
+                shoulder_width=shoulder_width,
+            )
+        )
+    return tuple(profiles)
+
+
+class PoseWorker:
+    """Runs the latest offered frame through Pose Landmarker on one worker thread."""
+
+    def __init__(self, model_path: Path) -> None:
+        self._model_path = model_path
+        self._lock = threading.Lock()
+        self._latest_frame: tuple[np.ndarray, tuple[int, int]] | None = None
+        self._latest_result: PoseFrame | None = None
+        self._pending = threading.Event()
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="pose-landmarker", daemon=True)
+        self._thread.start()
+
+    def offer(self, frame_bgr: np.ndarray, *, skip: bool = False) -> None:
+        if skip:
+            with self._lock:
+                self._latest_frame = None
+            self._pending.clear()
+            return
+        height, width = frame_bgr.shape[:2]
+        with self._lock:
+            self._latest_frame = (frame_bgr.copy(), (height, width))
+        self._pending.set()
+
+    def latest(self) -> PoseFrame | None:
+        with self._lock:
+            return self._latest_result
+
+    def close(self) -> None:
+        self._stopping.set()
+        self._pending.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        landmarker = None
+        try:
+            options = mp_vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=str(self._model_path)),
+                running_mode=mp_vision.RunningMode.VIDEO,
+                num_poses=2,
+            )
+            landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+            last_timestamp_ms = 0
+            next_inference_at = 0.0
+            while not self._stopping.is_set():
+                self._pending.wait()
+                if self._stopping.is_set():
+                    break
+                remaining = next_inference_at - time.monotonic()
+                if remaining > 0 and self._stopping.wait(remaining):
+                    break
+                self._pending.clear()
+                with self._lock:
+                    pending = self._latest_frame
+                    self._latest_frame = None
+                if pending is None:
+                    continue
+                frame_bgr, original_shape = pending
+                height, width = frame_bgr.shape[:2]
+                scaled_height = max(1, round(height * POSE_INPUT_WIDTH / width))
+                small = cv2.resize(
+                    frame_bgr,
+                    (POSE_INPUT_WIDTH, scaled_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=np.ascontiguousarray(rgb),
+                )
+                timestamp_ms = max(int(time.monotonic() * 1000), last_timestamp_ms + 1)
+                last_timestamp_ms = timestamp_ms
+                result = landmarker.detect_for_video(image, timestamp_ms)
+                pose_frame = PoseFrame(
+                    _pose_profiles(result, original_shape),
+                    time.monotonic(),
+                    original_shape,
+                )
+                with self._lock:
+                    self._latest_result = pose_frame
+                next_inference_at = time.monotonic() + 1.0 / POSE_FPS
+        except Exception:
+            LOG.exception("pose landmarker failed; continuing with hand-size and reach matching")
+        finally:
+            if landmarker is not None:
+                landmarker.close()
 
 
 @dataclass(frozen=True)
@@ -192,61 +353,68 @@ def pointer_sample(
     )
 
 
-def _tip(landmarks: Sequence[Any]) -> tuple[float, float]:
-    index = landmarks[INDEX_TIP]
-    return (min(max(float(index.x), 0.0), 1.0), min(max(float(index.y), 0.0), 1.0))
+class OneEuroFilter:
+    def __init__(
+        self,
+        *,
+        frequency: float = 30.0,
+        min_cutoff: float = 1.0,
+        beta: float = 0.007,
+        derivative_cutoff: float = 1.0,
+    ) -> None:
+        self.frequency = frequency
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.derivative_cutoff = derivative_cutoff
+        self._value: float | None = None
+        self._derivative = 0.0
+        self._timestamp: float | None = None
 
+    @staticmethod
+    def _alpha(cutoff: float, frequency: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        period = 1.0 / frequency
+        return 1.0 / (1.0 + tau / period)
 
-def _slot_distance(previous: tuple[float, float] | None, tip: tuple[float, float]) -> float:
-    if previous is None:
-        return 1e9
-    return math.hypot(previous[0] - tip[0], previous[1] - tip[1])
+    def update(self, value: float, timestamp: float) -> float:
+        if self._value is None or self._timestamp is None:
+            self._value = value
+            self._timestamp = timestamp
+            return value
+        self.frequency = 1.0 / max(timestamp - self._timestamp, 1e-6)
+        derivative = (value - self._value) * self.frequency
+        derivative_alpha = self._alpha(self.derivative_cutoff, self.frequency)
+        self._derivative += derivative_alpha * (derivative - self._derivative)
+        cutoff = self.min_cutoff + self.beta * abs(self._derivative)
+        alpha = self._alpha(cutoff, self.frequency)
+        self._value += alpha * (value - self._value)
+        self._timestamp = timestamp
+        return self._value
 
-
-def _assign_hands(
-    previous: Sequence[tuple[float, float] | None],
-    hands: Sequence[Sequence[Any]],
-) -> list[Sequence[Any] | None]:
-    """Keep each hand in the slot it occupied last frame, so pinches do not swap."""
-    if not hands:
-        return [None, None]
-    if len(hands) == 1:
-        hand = hands[0]
-        tip = _tip(hand)
-        prefer_second = previous[1] is not None and (
-            previous[0] is None or _slot_distance(previous[1], tip) < _slot_distance(previous[0], tip)
-        )
-        return [None, hand] if prefer_second else [hand, None]
-
-    first, second = hands[0], hands[1]
-    if previous[0] is None and previous[1] is None:
-        ordered = sorted((first, second), key=lambda hand: _tip(hand)[0])
-        return [ordered[0], ordered[1]]
-    if previous[0] is None:
-        if _slot_distance(previous[1], _tip(first)) <= _slot_distance(previous[1], _tip(second)):
-            return [second, first]
-        return [first, second]
-    if previous[1] is None:
-        if _slot_distance(previous[0], _tip(first)) <= _slot_distance(previous[0], _tip(second)):
-            return [first, second]
-        return [second, first]
-    keep = _slot_distance(previous[0], _tip(first)) + _slot_distance(previous[1], _tip(second))
-    swap = _slot_distance(previous[0], _tip(second)) + _slot_distance(previous[1], _tip(first))
-    return [first, second] if keep <= swap else [second, first]
+    def reset(self) -> None:
+        self._value = None
+        self._derivative = 0.0
+        self._timestamp = None
 
 
 class HandRig:
-    """Two hands, each with its own pinch hysteresis.
-
-    The sample's primary point is the first hand still visible. ``x2``/``y2``
-    are present only while a second hand is visible. A frame with no hands,
-    after a pinch, is one release sample so the cursor does not stay pinched.
-    """
+    """Lock onto the wake hand, then publish it as the primary pointer."""
 
     def __init__(self, engage: float, release: float) -> None:
         self._detectors = [PinchDetector(engage, release), PinchDetector(engage, release)]
-        self._positions: list[tuple[float, float] | None] = [None, None]
+        self._filters = [OneEuroFilter(), OneEuroFilter(), OneEuroFilter(), OneEuroFilter()]
+        self._profile: HandProfile | None = None
+        self._operator_pose: PoseProfile | None = None
+        self._last_main_wrist: tuple[float, float] | None = None
+        self._last_secondary_wrist: tuple[float, float] | None = None
+        self._locked = False
+        self._wake_started_at: float | None = None
+        self._wake_missed_frames = 0
+        self._lost_frames = 0
+        self._no_sample_since: float | None = None
         self._last: PointerSample | None = None
+        self._last_main_pinch_at: float | None = None
+        self._challenger_since: float | None = None
 
     @property
     def engage(self) -> float:
@@ -260,57 +428,416 @@ class HandRig:
     def any_pinch(self) -> bool:
         return any(detector.active for detector in self._detectors)
 
+    @property
+    def lock_confident(self) -> bool:
+        return self._locked and self._lost_frames == 0
+
+    def should_skip_pose(
+        self,
+        hands: Sequence[Sequence[Any]] | None,
+        frame_shape: Sequence[int],
+    ) -> bool:
+        if not self.lock_confident or self._profile is None or len(hands or []) != 1:
+            return False
+        candidate, _, _ = self._candidate(0, hands[0], frame_shape, self._detectors[0].engage)
+        return lenient_hand_check(
+            candidate.wrist, candidate.size, self._profile, frame_shape
+        ).accepted
+
     def update(
         self,
         hands: Sequence[Sequence[Any]] | None,
         frame_shape: Sequence[int],
+        pose_frame: PoseFrame | None = None,
+        *,
+        now: float | None = None,
     ) -> PointerSample | None:
-        was_pinching = self.any_pinch
-        assigned = _assign_hands(self._positions, list(hands or [])[:2])
-        samples: list[PointerSample] = []
-        for index, landmarks in enumerate(assigned):
-            if not landmarks:
-                self._detectors[index].reset()
-                self._positions[index] = None
-                continue
-            sample = pointer_sample(landmarks, frame_shape, self._detectors[index])
-            if sample is None:
-                self._detectors[index].reset()
-                self._positions[index] = None
-                continue
-            self._positions[index] = (sample.x, sample.y)
-            samples.append(sample)
-
-        if not samples:
-            if was_pinching and self._last is not None:
-                released = PointerSample(
-                    x=self._last.x,
-                    y=self._last.y,
-                    pinch_active=False,
-                    pinch_ratio=self._last.pinch_ratio,
-                    pinch_distance_px=self._last.pinch_distance_px,
-                    x2=self._last.x2,
-                    y2=self._last.y2,
-                    pinch2_active=False if self._last.x2 is not None else None,
-                )
-                self._last = released
-                return released
-            return None
-
-        primary = samples[0]
-        secondary = samples[1] if len(samples) > 1 else None
-        combined = PointerSample(
-            x=primary.x,
-            y=primary.y,
-            pinch_active=primary.pinch_active,
-            pinch_ratio=primary.pinch_ratio,
-            pinch_distance_px=primary.pinch_distance_px,
-            x2=None if secondary is None else secondary.x,
-            y2=None if secondary is None else secondary.y,
-            pinch2_active=None if secondary is None else secondary.pinch_active,
+        timestamp = time.monotonic() if now is None else now
+        detections = list(hands or [])[:3]
+        pose_is_fresh = (
+            pose_frame is not None
+            and (timestamp - pose_frame.captured_at) * 1000 < POSE_MAX_AGE_MS
         )
-        self._last = combined
-        return combined
+        poses = pose_frame.poses if pose_is_fresh and pose_frame is not None else ()
+        if pose_is_fresh and pose_frame is not None and self._operator_pose is not None:
+            pose_index = match_operator_pose(self._operator_pose, poses, frame_shape)
+            if pose_index is not None:
+                self._operator_pose = poses[pose_index]
+
+        candidates: list[HandCandidate] = []
+        raw_by_index: dict[int, tuple[Sequence[Any], float, float]] = {}
+        for index, landmarks in enumerate(detections):
+            candidate, ratio, pinch_distance = self._candidate(
+                index, landmarks, frame_shape, self._detectors[0].engage
+            )
+            if self._locked and self._profile is not None:
+                operator_pose, other_poses = self._current_operator_pose(poses, frame_shape)
+                decision = decide_hand(
+                    candidate.wrist,
+                    candidate.size,
+                    self._profile,
+                    operator_pose,
+                    other_poses,
+                    frame_shape,
+                    pose_fresh=pose_is_fresh,
+                )
+            else:
+                decision = None
+            if decision is None or decision.accepted:
+                candidates.append(candidate)
+                raw_by_index[index] = (landmarks, ratio, pinch_distance)
+            if DEBUG_HANDS:
+                reason = "size ok" if decision is None else decision.reason
+                status = "accepted" if decision is None or decision.accepted else "rejected"
+                print(f"hand {index}: {status} ({reason})")
+
+        if candidates:
+            candidates = self._carry_pinch_state(candidates, raw_by_index, frame_shape)
+        hold_previous = (
+            self._last_main_pinch_at is not None
+            and timestamp - self._last_main_pinch_at < SWITCH_COOLDOWN_S
+        )
+        main = choose_main_hand(
+            candidates, self._last_main_wrist, frame_shape, hold_previous=hold_previous
+        )
+        if main is not None and self._last_main_wrist is not None and len(candidates) > 1:
+            incumbent = min(
+                candidates,
+                key=lambda c: distance_px(c.wrist, self._last_main_wrist, frame_shape),
+            )
+            if main.index != incumbent.index:
+                if self._challenger_since is None:
+                    self._challenger_since = timestamp
+                if timestamp - self._challenger_since < SWITCH_HOLD_S:
+                    main = incumbent
+            else:
+                self._challenger_since = None
+        else:
+            self._challenger_since = None
+        if main is None:
+            self._lost_frames += 1
+            self._wake_missed_frames += 1
+            was_pinching = self.any_pinch
+            if self._lost_frames >= SWITCH_FRAMES:
+                self._reset_motion()
+            if self._lost_frames > LOST_GRACE_FRAMES:
+                self._last_main_wrist = None
+                self._last_secondary_wrist = None
+            if self._wake_missed_frames > WAKE_MISSED_FRAME_TOLERANCE:
+                self._wake_started_at = None
+                self._wake_missed_frames = 0
+            sample = self._release_sample(was_pinching)
+            self._note_sample(sample, timestamp)
+            if (
+                self._locked
+                and self._no_sample_since is not None
+                and timestamp - self._no_sample_since >= NO_HAND_SLEEP_SECONDS
+            ):
+                self._release_lock()
+            return sample
+
+        others = [candidate for candidate in candidates if candidate.index != main.index]
+        if self._last_secondary_wrist is not None and others:
+            secondary = min(
+                others,
+                key=lambda candidate: distance_px(
+                    candidate.wrist, self._last_secondary_wrist, frame_shape
+                ),
+            )
+        else:
+            secondary = min(others, key=lambda candidate: candidate.wrist[0]) if others else None
+
+        previous_main = None
+        if self._last_main_wrist is not None and len(candidates) > 1:
+            previous_main = min(
+                candidates,
+                key=lambda candidate: distance_px(
+                    candidate.wrist, self._last_main_wrist, frame_shape
+                ),
+            )
+        main_changed = previous_main is not None and previous_main.index != main.index
+        if self._last_main_wrist is not None and self._profile is not None:
+            nearest_previous_distance = min(
+                distance_px(candidate.wrist, self._last_main_wrist, frame_shape)
+                for candidate in candidates
+            )
+            if nearest_previous_distance > 2.0 * self._profile.size:
+                main_changed = True
+            if self._last_secondary_wrist is not None and len(candidates) == 1:
+                distance_to_previous_secondary = distance_px(
+                    main.wrist, self._last_secondary_wrist, frame_shape
+                )
+                distance_to_previous_main = distance_px(
+                    main.wrist, self._last_main_wrist, frame_shape
+                )
+                if distance_to_previous_secondary < distance_to_previous_main:
+                    main_changed = True
+        if main_changed:
+            self._reset_motion()
+
+        main_landmarks, main_ratio, main_distance = raw_by_index[main.index]
+        primary_sample = pointer_sample(main_landmarks, frame_shape, self._detectors[0])
+        if primary_sample is None:
+            raise RuntimeError("selected hand has no pointer landmarks")
+        x, y = self._filter_point(primary_sample.x, primary_sample.y, 0, 1, timestamp)
+        primary_sample = PointerSample(
+            x=x,
+            y=y,
+            pinch_active=primary_sample.pinch_active,
+            pinch_ratio=main_ratio,
+            pinch_distance_px=main_distance,
+        )
+
+        secondary_sample = None
+        if secondary is not None:
+            secondary_landmarks, secondary_ratio, secondary_distance = raw_by_index[
+                secondary.index
+            ]
+            secondary_sample = pointer_sample(
+                secondary_landmarks, frame_shape, self._detectors[1]
+            )
+            if secondary_sample is None:
+                raise RuntimeError("selected secondary hand has no pointer landmarks")
+            x2, y2 = self._filter_point(
+                secondary_sample.x, secondary_sample.y, 2, 3, timestamp
+            )
+            secondary_sample = PointerSample(
+                x=x2,
+                y=y2,
+                pinch_active=secondary_sample.pinch_active,
+                pinch_ratio=secondary_ratio,
+                pinch_distance_px=secondary_distance,
+            )
+        else:
+            self._detectors[1].reset()
+            self._filters[2].reset()
+            self._filters[3].reset()
+
+        sample = PointerSample(
+            x=primary_sample.x,
+            y=primary_sample.y,
+            pinch_active=primary_sample.pinch_active,
+            pinch_ratio=primary_sample.pinch_ratio,
+            pinch_distance_px=primary_sample.pinch_distance_px,
+            x2=None if secondary_sample is None else secondary_sample.x,
+            y2=None if secondary_sample is None else secondary_sample.y,
+            pinch2_active=None if secondary_sample is None else secondary_sample.pinch_active,
+        )
+        self._last = sample
+        self._last_main_wrist = main.wrist
+        if sample.pinch_active:
+            self._last_main_pinch_at = timestamp
+        self._last_secondary_wrist = None if secondary is None else secondary.wrist
+        self._lost_frames = 0
+
+        if not self._locked:
+            if sample.pinch_active:
+                self._wake_missed_frames = 0
+                if self._wake_started_at is None:
+                    self._wake_started_at = timestamp
+                elif timestamp - self._wake_started_at >= WAKE_HOLD_SECONDS:
+                    self._locked = True
+                    self._profile = HandProfile(main.wrist, main.size)
+                    pose_index = link_operator_pose(main.wrist, poses, frame_shape)
+                    self._operator_pose = None if pose_index is None else poses[pose_index]
+                    self._wake_started_at = None
+                    self._reset_motion()
+                    sample = self._sample_with_fresh_pinch(
+                        main_landmarks,
+                        frame_shape,
+                        main_ratio,
+                        main_distance,
+                        secondary,
+                        raw_by_index,
+                        timestamp,
+                    )
+                    self._last = sample
+            elif self._wake_started_at is not None:
+                self._wake_missed_frames += 1
+                if self._wake_missed_frames > WAKE_MISSED_FRAME_TOLERANCE:
+                    self._wake_started_at = None
+                    self._wake_missed_frames = 0
+        elif self._profile is not None:
+            self._profile = HandProfile(main.wrist, self._profile.size)
+
+        self._note_sample(sample, timestamp)
+        return sample
+
+    def _candidate(
+        self,
+        index: int,
+        landmarks: Sequence[Any],
+        frame_shape: Sequence[int],
+        engage: float,
+    ) -> tuple[HandCandidate, float, float]:
+        height, width = frame_shape[:2]
+        wrist = (float(landmarks[WRIST].x), float(landmarks[WRIST].y))
+        size = _distance_px(
+            landmarks[WRIST], landmarks[MIDDLE_FINGER_MCP], width, height
+        )
+        pinch_distance = _distance_px(
+            landmarks[THUMB_TIP], landmarks[INDEX_TIP], width, height
+        )
+        ratio = pinch_distance / max(size, 1e-6)
+        candidate = HandCandidate(
+            index=index,
+            wrist=wrist,
+            size=size,
+            pinch=ratio < engage,
+        )
+        return candidate, ratio, pinch_distance
+
+    def _carry_pinch_state(
+        self,
+        candidates: list[HandCandidate],
+        raw_by_index: dict[int, tuple[Sequence[Any], float, float]],
+        frame_shape: Sequence[int],
+    ) -> list[HandCandidate]:
+        previous_roles = (
+            (self._last_main_wrist, self._detectors[0]),
+            (self._last_secondary_wrist, self._detectors[1]),
+        )
+        carried: list[HandCandidate] = []
+        for candidate in candidates:
+            active_detector = None
+            if any(wrist is not None for wrist, _ in previous_roles):
+                active_detector = min(
+                    (
+                        (distance_px(candidate.wrist, wrist, frame_shape), detector)
+                        for wrist, detector in previous_roles
+                        if wrist is not None
+                    ),
+                    key=lambda item: item[0],
+                )[1]
+            _, ratio, _ = raw_by_index[candidate.index]
+            pinching = candidate.pinch or (
+                active_detector is not None
+                and active_detector.active
+                and ratio <= active_detector.release
+            )
+            carried.append(
+                HandCandidate(
+                    index=candidate.index,
+                    wrist=candidate.wrist,
+                    size=candidate.size,
+                    pinch=pinching,
+                )
+            )
+        return carried
+
+    def _current_operator_pose(
+        self,
+        poses: Sequence[PoseProfile],
+        frame_shape: Sequence[int],
+    ) -> tuple[PoseProfile | None, tuple[PoseProfile, ...]]:
+        if self._operator_pose is None or not poses:
+            return None, tuple(poses)
+        pose_index = match_operator_pose(self._operator_pose, poses, frame_shape)
+        if pose_index is None:
+            return None, tuple(poses)
+        return poses[pose_index], tuple(
+            pose for index, pose in enumerate(poses) if index != pose_index
+        )
+
+    def _filter_point(
+        self,
+        x: float,
+        y: float,
+        x_filter: int,
+        y_filter: int,
+        timestamp: float,
+    ) -> tuple[float, float]:
+        return (
+            self._filters[x_filter].update(x, timestamp),
+            self._filters[y_filter].update(y, timestamp),
+        )
+
+    def _sample_with_fresh_pinch(
+        self,
+        main_landmarks: Sequence[Any],
+        frame_shape: Sequence[int],
+        main_ratio: float,
+        main_distance: float,
+        secondary: HandCandidate | None,
+        raw_by_index: dict[int, tuple[Sequence[Any], float, float]],
+        timestamp: float,
+    ) -> PointerSample:
+        primary = pointer_sample(main_landmarks, frame_shape, self._detectors[0])
+        if primary is None:
+            raise RuntimeError("wake hand has no pointer landmarks")
+        x, y = self._filter_point(primary.x, primary.y, 0, 1, timestamp)
+        secondary_sample = None
+        if secondary is not None:
+            landmarks, ratio, pinch_distance = raw_by_index[secondary.index]
+            secondary_sample = pointer_sample(landmarks, frame_shape, self._detectors[1])
+            if secondary_sample is None:
+                raise RuntimeError("selected secondary hand has no pointer landmarks")
+            x2, y2 = self._filter_point(
+                secondary_sample.x, secondary_sample.y, 2, 3, timestamp
+            )
+            secondary_sample = PointerSample(
+                x=x2,
+                y=y2,
+                pinch_active=secondary_sample.pinch_active,
+                pinch_ratio=ratio,
+                pinch_distance_px=pinch_distance,
+            )
+        return PointerSample(
+            x=x,
+            y=y,
+            pinch_active=primary.pinch_active,
+            pinch_ratio=main_ratio,
+            pinch_distance_px=main_distance,
+            x2=None if secondary_sample is None else secondary_sample.x,
+            y2=None if secondary_sample is None else secondary_sample.y,
+            pinch2_active=None
+            if secondary_sample is None
+            else secondary_sample.pinch_active,
+        )
+
+    def _reset_motion(self) -> None:
+        for detector in self._detectors:
+            detector.reset()
+        for point_filter in self._filters:
+            point_filter.reset()
+
+    def _release_sample(self, was_pinching: bool) -> PointerSample | None:
+        self._reset_motion()
+        if not was_pinching or self._last is None:
+            return None
+        released = PointerSample(
+            x=self._last.x,
+            y=self._last.y,
+            pinch_active=False,
+            pinch_ratio=self._last.pinch_ratio,
+            pinch_distance_px=self._last.pinch_distance_px,
+            x2=self._last.x2,
+            y2=self._last.y2,
+            pinch2_active=False if self._last.x2 is not None else None,
+        )
+        self._last = released
+        return released
+
+    def _note_sample(self, sample: PointerSample | None, timestamp: float) -> None:
+        if sample is None:
+            if self._no_sample_since is None:
+                self._no_sample_since = timestamp
+        else:
+            self._no_sample_since = None
+
+    def _release_lock(self) -> None:
+        self._locked = False
+        self._profile = None
+        self._operator_pose = None
+        self._last_main_wrist = None
+        self._last_secondary_wrist = None
+        self._lost_frames = 0
+        self._wake_started_at = None
+        self._wake_missed_frames = 0
+        self._no_sample_since = None
+        self._reset_motion()
+        self._last_main_pinch_at = None
+        self._challenger_since = None
 
 
 # --- capture + transport ---------------------------------------------------
@@ -404,6 +931,7 @@ async def stream(
     tracker: Any,
     rig: HandRig,
     settings: StreamSettings,
+    pose_worker: PoseWorker | None = None,
 ) -> None:
     """Push telemetry and video frames until the socket or camera fails."""
     telemetry_seq = 0
@@ -431,7 +959,16 @@ async def stream(
 
         if now - last_telemetry_at >= settings.telemetry_interval:
             hands = await asyncio.to_thread(tracker.detect, frame)
-            sample = rig.update(hands, frame.shape)
+            if pose_worker is not None:
+                pose_worker.offer(
+                    frame,
+                    skip=rig.should_skip_pose(hands, frame.shape),
+                )
+            sample = rig.update(
+                hands,
+                frame.shape,
+                None if pose_worker is None else pose_worker.latest(),
+            )
             last_telemetry_at = now
 
             if sample is not None:
@@ -506,6 +1043,21 @@ def ensure_model(path: Path) -> Path:
     return path
 
 
+def ensure_pose_model(path: Path) -> Path:
+    """Return the lite pose model, downloading it if needed."""
+    if path.is_file():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    LOG.info("downloading pose landmarker lite model to %s", path)
+    temporary = path.with_name(path.name + ".part")
+    with urllib.request.urlopen(POSE_MODEL_URL, timeout=120) as response, temporary.open(
+        "wb"
+    ) as out:
+        shutil.copyfileobj(response, out)
+    temporary.replace(path)
+    return path
+
+
 async def run(args: argparse.Namespace) -> None:
     model_path = ensure_model(Path(args.model))
     camera = Camera(args.camera, args.width, args.height)
@@ -514,10 +1066,16 @@ async def run(args: argparse.Namespace) -> None:
         min_detection_confidence=args.min_detection_confidence,
         min_tracking_confidence=args.min_tracking_confidence,
     )
+    pose_worker = None
+    try:
+        pose_worker = PoseWorker(ensure_pose_model(POSE_MODEL))
+    except (OSError, urllib.error.URLError) as exc:
+        LOG.warning("pose helper unavailable (%s); using hand-size and reach matching", exc)
+
     rig = HandRig(args.pinch_engage, args.pinch_release)
     settings = StreamSettings(args.telemetry_fps, args.video_fps, args.jpeg_quality)
     LOG.info(
-        "camera %d at %dx%d, telemetry %g fps, video %g fps, two hands, pinch %.2f..%.2f",
+        "camera %d at %dx%d, telemetry %g fps, video %g fps, three hands, pinch %.2f..%.2f",
         args.camera,
         args.width,
         args.height,
@@ -525,6 +1083,16 @@ async def run(args: argparse.Namespace) -> None:
         settings.video_fps,
         rig.engage,
         rig.release,
+    )
+    LOG.info(
+        "operator lock size %.1f..%.1f, reach %.1fx, pose %.0f fps / %d px, wrist match %.1fx, debug=%s",
+        SIZE_MIN_RATIO,
+        SIZE_MAX_RATIO,
+        ARM_REACH_RATIO,
+        POSE_FPS,
+        POSE_INPUT_WIDTH,
+        WRIST_MATCH_DISTANCE,
+        DEBUG_HANDS,
     )
 
     try:
@@ -534,7 +1102,7 @@ async def run(args: argparse.Namespace) -> None:
                     LOG.info("connected to %s", args.server)
                     reader = asyncio.create_task(log_server_frames(websocket))
                     try:
-                        await stream(websocket, camera, tracker, rig, settings)
+                        await stream(websocket, camera, tracker, rig, settings, pose_worker)
                     finally:
                         reader.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -545,6 +1113,8 @@ async def run(args: argparse.Namespace) -> None:
     finally:
         camera.release()
         tracker.close()
+        if pose_worker is not None:
+            pose_worker.close()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

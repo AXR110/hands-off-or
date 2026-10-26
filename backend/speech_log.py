@@ -125,6 +125,11 @@ class SpeechLogSession:
         self._gap = 0.0
         return events
 
+    def stop(self) -> list[dict[str, str]]:
+        if self.phase != "recording":
+            return []
+        return self._finish()
+
     def gap(self, seconds: float) -> list[dict[str, str]]:
         if self.phase != "recording" or seconds <= 0:
             return []
@@ -133,4 +138,3 @@ class SpeechLogSession:
         if self._gap < threshold:
             return []
         return self._finish()
-

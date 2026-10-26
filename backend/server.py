@@ -220,6 +220,7 @@ class VoiceStatusFrame(BaseModel):
 
     type: Literal["voice_status"] = "voice_status"
     active: bool = True
+    level: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class SpeechLogFrame(BaseModel):
@@ -623,6 +624,7 @@ async def handle_voice_status(client: Client, frame: VoiceStatusFrame) -> None:
         {
             "type": "voice_status",
             "active": frame.active,
+            "level": frame.level,
             "source": client.id,
             "server_ts": _now_ms(),
         },
@@ -701,6 +703,13 @@ async def handle_text(client: Client, raw: str) -> None:
                 return
             else:
                 await send_protocol_error(client, "forbidden_role", "start_recording is only accepted from a viewer client")
+                return
+        elif kind == "stop_recording":
+            if client.role == "viewer":
+                await bridge.broadcast({"type": "stop_recording"}, exclude=client.id, roles={"input"})
+                return
+            else:
+                await send_protocol_error(client, "forbidden_role", "stop_recording is only accepted from a viewer client")
                 return
         elif kind == "pick_images":
             await handle_pick_images(client)

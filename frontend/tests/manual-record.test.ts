@@ -9,4 +9,6 @@ test('page.tsx contains manual record attributes', () => {
   assert.ok(src.includes('data-start-recording'), 'missing data-start-recording');
   assert.ok(src.includes('Record'), 'missing Record label');
   assert.ok(src.includes('start_recording'), 'missing start_recording string');
+  assert.ok(src.includes('stop_recording'), 'missing stop_recording string');
+  assert.ok(src.includes('aria-pressed={speechLog.recording}'), 'record button is not a toggle');
 });
